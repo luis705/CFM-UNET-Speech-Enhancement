@@ -1,0 +1,61 @@
+dataset:
+  hf_repo: 'JacobLinCool/VoiceBank-DEMAND-16k'
+  cache_dir: './cache'
+
+data:
+  # Data loader
+  batch_size: 20
+  num_workers: 8
+
+  # Model I/O
+  input_channels: 4
+  output_channels: 2
+
+  # Splits
+  val_split: 0.1
+
+
+audio:
+  sample_rate: 16000
+  audio_length_seconds: 2
+  # FFT settings
+  fft_size: 512
+  hop_length: 128
+  window_size: 256
+  # Power law compression settings
+  alpha: 0.5
+
+model:
+  time_emb_dim: 128
+  projection_dim: 32
+  n_blocks: 4
+  compression_factor: 2
+  channels_factor: 2
+  num_heads: 4
+  ff_mult: 3
+  n_groups: 16
+  gradient_checkpointing: true
+
+ode:
+  val_steps: 10
+  test_steps: 50
+
+logging:
+  log_dir: tb_logs
+  n_audios: 4
+
+training:
+  early_stop_patience: 5
+  precision: "bf16-mixed"
+  max_epochs: 100
+  accum_batches: 2
+  grad_clip: 1.0
+  validation_slow_metrics_pct: 0.1
+  histogram_logging_frequency: 100
+  val_interval: 1.0
+
+  # Optimizer
+  optim:
+    lr: 2e-4
+    weight_decay: 1e-5
+    pct_start: 0.1

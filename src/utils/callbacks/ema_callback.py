@@ -12,6 +12,7 @@ class EMACallback(pl.Callback):
         self.ema_decay = ema_decay
         self._ema_params: dict[str, torch.Tensor] = {}
         self._originals: dict[str, torch.Tensor] = {}
+        self._last_global_step = -1
 
     # ── Initialise shadow params ─────────────────────────────────────────
 
@@ -24,9 +25,15 @@ class EMACallback(pl.Callback):
 
     @torch.no_grad()
     def on_train_batch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule, outputs, batch, batch_idx) -> None:
+        if trainer.global_step == self._last_global_step:
+            return
+
+        self._last_global_step = trainer.global_step
+
         d = self.ema_decay
         for name, param in pl_module.named_parameters():
             if name in self._ema_params:
+                # Shadow = Shadow * d + Param * (1 - d)
                 self._ema_params[name].mul_(d).add_(param.data, alpha=1.0 - d)
 
     # ── Swap to EMA for validation ───────────────────────────────────────

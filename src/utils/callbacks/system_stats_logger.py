@@ -43,4 +43,3 @@ class SystemStatsLoggerCallback(pl.Callback):
         pl_module.log("perf/gpu", gpu_util, on_step=True, logger=True, prog_bar=False)
         pl_module.log("perf/vram", vram, on_step=True, logger=True, prog_bar=False)
         pl_module.log("perf/temp", temp, on_step=True, logger=True, prog_bar=False)
-

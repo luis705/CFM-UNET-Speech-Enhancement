@@ -27,6 +27,10 @@ dependencies = [
     "gputil>=1.4.0",
     "matplotlib>=3.10.8",
     "onnxscript>=0.6.2",
+    "torchview>=0.2.7",
+    "graphviz>=0.21",
+    "einops>=0.8.2",
+    "torchinfo>=1.8.0",
 ]
 
 [dependency-groups]

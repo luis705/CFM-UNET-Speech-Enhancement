@@ -1,0 +1,3 @@
+- [ ] Salvar waveforms na validação
+- [ ] Na validação salvar espectro em escala logarítimica - foca em frequências baixas, voz
+- [ ] 

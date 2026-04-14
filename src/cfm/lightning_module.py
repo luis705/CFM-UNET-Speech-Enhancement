@@ -1,159 +1,343 @@
+from einops import rearrange
 import pytorch_lightning as pL
 import torch
 import torch.nn.functional as F
+from torchmetrics.functional.audio import scale_invariant_signal_distortion_ratio, deep_noise_suppression_mean_opinion_score
 
-from src.cfm.loss import cfm_loss
+from src.cfm.loss import MRSTFTLoss, cfm_loss
 from src.cfm.solver import ode_solve
-from src.data.transforms import stft_to_waveform
+from src.data.transforms import preprocess_item, signal_to_stft, stft_to_waveform
 from src.model.unet import CFMUnet
-from src.utils.metrics import compute_dnsmos, compute_estoi, compute_wb_pesq
+from src.utils.metrics import compute_estoi, compute_wb_pesq
+from src.utils.settings import Settings
 
 
 class CFMModule(pL.LightningModule):
-    def __init__(
-        self,
-        in_channels: int = 4,
-        out_channels: int = 2,
-        time_emb_dim: int = 128,
-        projection_dim: int = 32,
-        n_blocks: int = 4,
-        compression_factor: int = 2,
-        channels_factor: int = 2,
-        num_heads: int = 4,
-        ff_mult: int = 2,
-        n_groups: int = 4,
-        gradient_checkpointing: bool = True,
-        ode_val_steps: int = 10,
-        ode_test_steps: int = 10,
-        audio_length_seconds: int = 5,
-        audio_sample_rate: int = 16000,
-        fft_size: int = 512,
-        hop_length: int = 128,
-        window_size: int = 256,
-        alpha: float = 0.5,
-        lr: float = 1e-4,
-        weight_decay: float = 1e-4,
-        pct_start: float = 0.1,
-        validation_slow_metrics_pct: float = 0.1,
-        histogram_logging_frequency: int = 100,
-        n_audios_to_log: int = 4,
-    ):
+    def __init__(self, cfg: Settings):
         super().__init__()
+        # Salva as configurações para o logger (TensorBoard/WandB) e checkpoints
+        self.save_hyperparameters(cfg.model_dump())
+        self.cfg = cfg
+
         self.model = CFMUnet(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            time_emb_dim=time_emb_dim,
-            projection_dim=projection_dim,
-            n_blocks=n_blocks,
-            compression_factor=compression_factor,
-            channels_factor=channels_factor,
-            num_heads=num_heads,
-            ff_mult=ff_mult,
-            n_groups=n_groups,
-            gradient_checkpointing=gradient_checkpointing,
+            in_channels=cfg.data.input_channels,
+            out_channels=cfg.data.output_channels,
+            time_emb_dim=cfg.model.time_emb_dim,
+            projection_dim=cfg.model.projection_dim,
+            n_blocks=cfg.model.n_blocks,
+            compression_factor=cfg.model.compression_factor,
+            channels_factor=cfg.model.channels_factor,
+            num_heads=cfg.model.num_heads,
+            ff_mult=cfg.model.ff_mult,
+            n_groups=cfg.model.n_groups,
+            gradient_checkpointing=cfg.model.gradient_checkpointing,
         )
 
-        # ODE Solver
-        self.ode_val_steps = ode_val_steps
-        self.ode_test_steps = ode_test_steps
+        # ODE
+        self.ode_val_steps = cfg.ode.val_steps
+        self.ode_test_steps = cfg.ode.test_steps
 
         # Audio
-        self.audio_length_seconds = audio_length_seconds
-        self.audio_sample_rate = audio_sample_rate
-        self.fft_size = fft_size
-        self.hop_length = hop_length
-        self.window_size = window_size
-        self.alpha = alpha
+        self.audio_length_seconds = cfg.audio.audio_length_seconds
+        self.audio_sample_rate = cfg.audio.sample_rate
+        self.fft_size = cfg.audio.fft_size
+        self.hop_length = cfg.audio.hop_length
+        self.window_size = cfg.audio.window_size
+        self.alpha = cfg.audio.alpha
 
         # Optimizer
-        self.lr = lr
-        self.weight_decay = weight_decay
-        self.pct_start = pct_start
+        self.lr = cfg.training.optim.lr
+        self.weight_decay = cfg.training.optim.weight_decay
+        self.pct_start = cfg.training.optim.pct_start
 
-        # Others
-        self.validation_slow_metrics_pct = validation_slow_metrics_pct
-        self.save_hyperparameters()
+        # Losses
+        self.lambda_cfm = cfg.training.losses.cfm.lambda_value
+        self.snr_min_val = cfg.training.losses.cfm.snr_min_val
+        self.mrstft_lambda_max = cfg.training.losses.mrstft.lambda_max
+        self.mrstft_start_epoch = cfg.training.losses.mrstft.start_epoch
+        self.mrstft_end_epoch = cfg.training.losses.mrstft.end_epoch
+
+        # Logging
+        self.validation_slow_metrics_pct = cfg.training.validation_slow_metrics_pct
+        self.n_audios_to_log = cfg.logging.n_audios
         self.val_audio_buffer = []
-        self.histogram_logging_frequency = histogram_logging_frequency
-        self.n_audios_to_log = n_audios_to_log
+        self.test_audio_buffer = []
+        self.test_metrics_buffer = []
+        self._baseline_cache = {}
 
-        # (B, C, F, T)
-        # Aqui, é o que o forward espera, ou seja, apenas o áudio sujo
-        # Por isso fazemos C = in_channels // 2, já que in_channels considera
-        # Ambos sujo e limpo
-        self.example_input_array = torch.zeros(
-            (   1,
-                in_channels // 2,
-                fft_size // 2 + 1,
-                audio_length_seconds * audio_sample_rate // hop_length
-            )
-        ).to(self.device)
+        self.mrstft_loss_func = MRSTFTLoss(
+            cfg.training.losses.mrstft.fft_sizes,
+            cfg.training.losses.mrstft.hop_sizes,
+            cfg.training.losses.mrstft.win_sizes,
+        )
+
+        # Waveform input: (Batch, Channels, Time)
+        self.example_input_array = torch.zeros(1, 1, self.audio_length_seconds * self.audio_sample_rate)
 
     def training_step(self, batch, batch_idx):
-        _, _, noisy_stft, clean_stft, _, _ = batch
-        loss, v_pred = self.__interpolate_and_generate_cfm_loss(noisy_stft, clean_stft)
-        self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True)
+        noisy_wav, clean_wav = batch
 
-        if batch_idx % self.histogram_logging_frequency == 0:
-            tensorboard = self.logger.experiment
+        # Preprocessamento na GPU
+        _, clean_wav_p, noisy_stft, clean_stft, mean, std = preprocess_item(
+            noisy_wav,
+            clean_wav,
+            pad_crop=True,
+            length=self.audio_length_seconds * self.audio_sample_rate,
+            fft_size=self.fft_size,
+            hop_length=self.hop_length,
+            window_size=self.window_size,
+            alpha=self.alpha,
+        )
 
-            # Logando a distribuição das predições do campo vetorial
-            tensorboard.add_histogram("train/v_pred_dist", v_pred.detach().cpu(), global_step=self.global_step)
+        cfm_l, v_pred = self.__interpolate_and_generate_cfm_loss(noisy_stft, clean_stft)
 
-            for name, param in self.model.named_parameters():
-                tensorboard.add_histogram(f"weights/{name}", param.detach().cpu(), global_step=self.global_step)
-                if param.grad is not None:
-                    tensorboard.add_histogram(f"grads/{name}", param.grad.detach().cpu(), global_step=self.global_step)
-            self.logger.experiment.flush()
+        # Cálculo dinâmico do peso da MR-STFT
+        lambda_mrstft = self._get_lambda_mrstft(batch_idx)
+
+        if lambda_mrstft > 0:
+            est_clean_stft = noisy_stft + v_pred
+            est_clean_wav = stft_to_waveform(
+                est_clean_stft,
+                length=self.audio_length_seconds * self.audio_sample_rate,
+                fft_size=self.fft_size,
+                hop_length=self.hop_length,
+                window_size=self.window_size,
+                alpha=self.alpha,
+                mean=mean,
+                std=std,
+            )
+            # MRSTFTLoss espera (B, T)
+            mr_l = self.mrstft_loss_func(est_clean_wav, clean_wav_p.squeeze(1))
+
+        else:
+            mr_l = torch.tensor(0.0, device=self.device)
+
+        loss = self.lambda_cfm * cfm_l + lambda_mrstft * mr_l
+
+        self.log("train/loss", loss.detach(), prog_bar=True, on_step=True, on_epoch=True)
+        self.log("train/loss_cfm", cfm_l.detach(), on_step=True, on_epoch=True)
+        self.log("train/loss_mrstft", mr_l.detach(), on_step=True, on_epoch=True)
+        self.log("train/lambda_mrstft", torch.tensor(lambda_mrstft, device=self.device), on_step=True, on_epoch=True)
+
         return loss
 
     def validation_step(self, batch, batch_idx):
-        noisy_wav, clean_wav, noisy_stft, clean_stft, mean, std = batch
-        cfm_loss, _ = self.__interpolate_and_generate_cfm_loss(noisy_stft, clean_stft)
+        noisy_wav, clean_wav = batch
 
+        # 1. Preprocessamento padrão (Crop para cálculo da Loss)
+        # Isso garante que a loss de validação seja comparável com a de treino
+        _, clean_wav_p, noisy_stft_crop, clean_stft_crop, mean, std = preprocess_item(
+            noisy_wav,
+            clean_wav,
+            pad_crop=True,
+            length=self.audio_length_seconds * self.audio_sample_rate,
+            fft_size=self.fft_size,
+            hop_length=self.hop_length,
+            window_size=self.window_size,
+            alpha=self.alpha,
+        )
+
+        # Cálculo da Loss (Sempre feito para monitorar convergência)
+        cfm_l, v_pred = self.__interpolate_and_generate_cfm_loss(noisy_stft_crop, clean_stft_crop)
+
+        lambda_mrstft = self._get_lambda_mrstft(batch_idx)
+
+        if lambda_mrstft > 0:
+            est_clean_stft = noisy_stft_crop + v_pred
+            est_clean_wav = stft_to_waveform(
+                est_clean_stft,
+                length=self.audio_length_seconds * self.audio_sample_rate,
+                fft_size=self.fft_size,
+                hop_length=self.hop_length,
+                window_size=self.window_size,
+                alpha=self.alpha,
+                mean=mean,
+                std=std,
+            )
+            mr_l = self.mrstft_loss_func(est_clean_wav, clean_wav_p.squeeze(1))
+
+        else:
+            mr_l = torch.tensor(0.0, device=self.device)
+
+        loss = self.lambda_cfm * cfm_l + lambda_mrstft * mr_l
+
+        self.log("val/loss", loss.detach(), prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val/loss_cfm", cfm_l.detach(), on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val/loss_mrstft", mr_l.detach(), on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val/lambda_mrstft", torch.tensor(lambda_mrstft, device=self.device), on_step=False, on_epoch=True, sync_dist=True)
+
+        # 2. Métricas lentas (OLA + PESQ) em uma fração dos dados
         num_val_batches = self.trainer.num_val_batches[0]
         limit = max(1, int(num_val_batches * self.validation_slow_metrics_pct))
+
         if batch_idx < limit:
-            enhanced_stft = ode_solve(self.model, noisy_stft, n_steps=self.ode_val_steps)
-            enhanced_wav = stft_to_waveform(
-                    enhanced_stft,
-                    length=self.audio_length_seconds * self.audio_sample_rate,
-                    fft_size=self.fft_size,
-                    hop_length=self.hop_length,
-                    window_size=self.window_size,
-                    alpha=self.alpha,
-                    mean=mean,
-                    std=std,
-                )
-            
-            val_mse_audio = F.mse_loss(enhanced_stft, clean_stft)
-            pesq = compute_wb_pesq(enhanced_wav, clean_wav)
+            self.process_and_log_metrics(noisy_wav, clean_wav, "val", self.val_audio_buffer, batch_idx)
 
-            self.log("val/pesq", pesq, prog_bar=True, on_step=True, on_epoch=True)
-            self.log("val/mse_audio", val_mse_audio, prog_bar=True, on_step=True, on_epoch=True)
+        return loss
 
-            if len(self.val_audio_buffer) < self.n_audios_to_log:
-                needed = self.n_audios_to_log - len(self.val_audio_buffer)
-                to_take = min(needed, noisy_wav.shape[0])
-                for i in range(to_take):
-                    self.val_audio_buffer.append((
-                        clean_wav[i].detach().cpu(),
-                        noisy_wav[i].detach().cpu(),
-                        enhanced_wav[i].detach().cpu()
-                    ))
-        self.log("val/loss_cfm", cfm_loss, prog_bar=True, on_step=True, on_epoch=True)
-        return cfm_loss
+    def _get_lambda_mrstft(self, batch_idx: int) -> float:
+        """Calcula o peso da loss MR-STFT com rampa linear a cada passo."""
+        if self.trainer is None:
+            return 0.0
+
+        current_epoch = self.current_epoch
+        start = self.mrstft_start_epoch
+        end = self.mrstft_end_epoch
+
+        if current_epoch < start:
+            return 0.0
+        if current_epoch >= end:
+            return self.mrstft_lambda_max
+
+        # Rampa linear entre épocas incluindo progressão intra-época (passos)
+        steps_per_epoch = self.trainer.num_training_batches
+        if steps_per_epoch == 0 or steps_per_epoch == float("inf"):
+            return self.mrstft_lambda_max * (current_epoch - start) / (end - start)
+
+        t = (current_epoch - start) / (end - start)
+        t += (batch_idx / steps_per_epoch) / (end - start)
+
+        return self.mrstft_lambda_max * max(0.0, min(1.0, t))
 
     def test_step(self, batch, batch_idx):
-        _, clean_wav, noisy_stft, _, mean, std = batch
+        noisy_wav, clean_wav = batch
+        metrics_list = self.process_and_log_metrics(noisy_wav, clean_wav, "test", self.test_audio_buffer, batch_idx)
+        self.test_metrics_buffer.extend(metrics_list)
 
-        # 1. Geração com qualidade máxima (50 a 100 passos)
-        enhanced_stft = ode_solve(self.model, noisy_stft, n_steps=self.ode_test_steps)
+    def forward(self, x, n_steps: int = None):
+        n_steps = n_steps or self.ode_test_steps
+        return self.process_ola(x, n_steps=n_steps)
 
-        # 2. Reconstrução do áudio (Transformada Inversa)
-        enhanced_wav = stft_to_waveform(
-            enhanced_stft,
-            length=self.audio_length_seconds * self.audio_sample_rate,
+    def process_and_log_metrics(self, noisy_wav: torch.Tensor, clean_wav: torch.Tensor, log_suffix: str, buffer: list, batch_idx: int):
+        # Roda o OLA no áudio completo
+        n_steps = self.ode_val_steps if log_suffix == "val" else self.ode_test_steps
+        enhanced_wav = self.process_ola(noisy_wav, n_steps=n_steps)
+
+        # Para o MSE de áudio, precisamos do STFT do áudio realçado
+        enhanced_stft = signal_to_stft(enhanced_wav, self.fft_size, self.hop_length, self.window_size, self.alpha)
+
+        # Garante o alinhamento caso haja pequenas diferenças residuais do OLA
+        T_target = enhanced_wav.shape[-1]
+        clean_wav_aligned = clean_wav[..., :T_target]
+        clean_stft = signal_to_stft(clean_wav_aligned, self.fft_size, self.hop_length, self.window_size, self.alpha)
+
+        # Cálculo individual por áudio no batch para granularidade total
+        B = noisy_wav.shape[0]
+        individual_metrics = []
+
+        dnsmos = deep_noise_suppression_mean_opinion_score(enhanced_wav, self.audio_sample_rate, personalized=True)
+        dnsmos_noisy = deep_noise_suppression_mean_opinion_score(noisy_wav, self.audio_sample_rate, personalized=True)
+        dnsmos_clean = deep_noise_suppression_mean_opinion_score(clean_wav_aligned, self.audio_sample_rate, personalized=True)
+
+        for i in range(B):
+            s_enhanced = enhanced_wav[i]
+            s_clean = clean_wav_aligned[i]
+            s_noisy = noisy_wav[i]
+
+            # --- Baseline Metrics (Cached) ---
+            # Identificador único por split e amostra para evitar colisões
+            sample_key = (log_suffix, batch_idx, i)
+            
+            if sample_key not in self._baseline_cache:
+                # DNSMOS para noisy e clean (cálculo pesado feito apenas 1 vez)
+                
+                self._baseline_cache[sample_key] = {
+                    "PESQ_NOISY": float(compute_wb_pesq(s_noisy, s_clean)),
+                    "STOI_NOISY": float(compute_estoi(s_noisy, s_clean)),
+                    "SI_SDR_NOISY": float(scale_invariant_signal_distortion_ratio(s_noisy, s_clean)),
+                }
+
+            # Métricas individuais (PESQ e STOI geralmente operam em amostras únicas)
+            pesq = float(compute_wb_pesq(s_enhanced, s_clean))
+            stoi = float(compute_estoi(s_enhanced, s_clean))
+
+            si_sdr_val = float(scale_invariant_signal_distortion_ratio(s_enhanced, s_clean))
+
+            mse = F.mse_loss(enhanced_stft[i : i + 1], clean_stft[i : i + 1]).item()
+
+            res = {
+                'sample': {
+                    "PESQ": pesq,
+                    "STOI": stoi,
+                    "SI_SDR": si_sdr_val,
+                    "MSE_AUDIO": mse,
+                },
+                'DNSMOS': {
+                    "MOS": dnsmos[i, 0, 0].item(),
+                    "SIG": dnsmos[i, 0, 1].item(),
+                    "BAK": dnsmos[i, 0, 2].item(),
+                    "OVL": dnsmos[i, 0, 3].item(),
+                    "CLEAN_MOS": dnsmos_clean[i, 0, 0].item(),
+                    "CLEAN_SIG": dnsmos_clean[i, 0, 1].item(),
+                    "CLEAN_BAK": dnsmos_clean[i, 0, 2].item(),
+                    "CLEAN_OVL": dnsmos_clean[i, 0, 3].item(),
+                    "NOISY_MOS": dnsmos_noisy[i, 0, 0].item(),
+                    "NOISY_SIG": dnsmos_noisy[i, 0, 1].item(),
+                    "NOISY_BAK": dnsmos_noisy[i, 0, 2].item(),
+                    "NOISY_OVL": dnsmos_noisy[i, 0, 3].item(),
+                }
+            }
+            # Adiciona métricas baseadas no cache para a média do batch e buffer de áudio
+            res["sample"].update(self._baseline_cache[sample_key])
+            individual_metrics.append(res)
+
+            # Salva no buffer de áudio (LoggingCallback) se ainda houver espaço
+            if len(buffer) < self.n_audios_to_log:
+                buffer.append(
+                    {
+                        "clean": s_clean.detach().cpu(),
+                        "noisy": s_noisy.detach().cpu(),
+                        "enhanced": s_enhanced.detach().cpu(),
+                        "metrics": res
+                    }
+                )
+
+        # Log das médias do batch para o Lightning (Scalars do TensorBoard)
+        if individual_metrics:
+            for outer_key in individual_metrics[0].keys():
+                for inner_key in individual_metrics[0][outer_key].keys():
+                    avg = sum(m[outer_key][inner_key] for m in individual_metrics) / B
+                    self.log(f"{log_suffix}_{outer_key}/{inner_key}", avg, sync_dist=True, prog_bar=True, on_epoch=True)
+
+        return individual_metrics
+
+    @torch.no_grad()
+    def process_ola(self, noisy_wav: torch.Tensor, n_steps: int) -> torch.Tensor:
+        B, _C, T_orig = noisy_wav.shape
+        win_len = int(self.audio_length_seconds * self.audio_sample_rate)
+        hop_len = win_len // 2
+
+        # 1. Pad para ser múltiplo do hop e garantir que a última janela caiba
+        pad_total = hop_len - (T_orig % hop_len)
+        noisy_padded = F.pad(noisy_wav, (0, pad_total + hop_len))
+        T_pad = noisy_padded.shape[-1]
+
+        # 2. Chunking (B, C, T_pad) -> (B, C, win_len, n_chunks) -> (B*n_chunks, C, win_len)
+        chunks = noisy_padded.unfold(-1, win_len, hop_len)
+        n_chunks = chunks.shape[-2]
+        chunks = rearrange(chunks, "B C N L -> (B N) C L")
+
+        # 3. Uso do seu preprocess_item (Normaliza e gera STFT por chunk)
+        # Passamos noisy duas vezes pois na validação/inferência não temos o clean original do chunk
+        _, _, chunks_stft, _, mean, std = preprocess_item(
+            chunks,
+            chunks,
+            pad_crop=False,
+            length=win_len,
+            fft_size=self.fft_size,
+            hop_length=self.hop_length,
+            window_size=self.window_size,
+            alpha=self.alpha,
+        )
+
+        # 4. Modelo (ODE)
+        enhanced_stft_chunks = ode_solve(self.model, chunks_stft, n_steps=n_steps)
+
+        # 5. iSTFT + Desnormalização Local
+        # Como passamos o mean/std do chunk, o áudio já sai na escala correta para somar
+        enhanced_chunks = stft_to_waveform(
+            enhanced_stft_chunks,
+            length=win_len,
             fft_size=self.fft_size,
             hop_length=self.hop_length,
             window_size=self.window_size,
@@ -162,17 +346,22 @@ class CFMModule(pL.LightningModule):
             std=std,
         )
 
-        # 3. Cálculo das métricas oficiais (Exemplo usando torchmetrics)
-        pesq_score = compute_wb_pesq(enhanced_wav, clean_wav)
-        stoi_score = compute_estoi(enhanced_wav, clean_wav)
-        dnsmos_score = compute_dnsmos(enhanced_wav, clean_wav)
+        # 6. Reconstrução Eficiente com Fold
+        # Aplicamos a janela de Hann para crossfade
+        window = torch.hann_window(win_len, device=self.device).view(1, 1, win_len)
+        enhanced_chunks = enhanced_chunks * window
 
-        # 4. Logamos as métricas (o Lightning vai tirar a média de todo o dataset de teste)
-        self.log("test/PESQ", pesq_score, sync_dist=True)
-        self.log("test/STOI", stoi_score, sync_dist=True)
-        # self.log("test/DNSMOS", dnsmos_score, sync_dist=True)
+        # Preparamos para o F.fold: (B, C*win_len, n_chunks)
+        combined = rearrange(enhanced_chunks, "(B N) C L -> B (C L) N", B=B)
 
-        # Opcional: código para salvar o enhanced_wav no disco usando torchaudio.save(...)
+        # Soma os chunks sobrepostos
+        output = F.fold(combined, output_size=(1, T_pad), kernel_size=(1, win_len), stride=(1, hop_len))
+
+        # Soma os pesos das janelas para normalizar a amplitude no overlap
+        window_ones = window.expand(B, n_chunks, -1).transpose(1, 2)  # (B, win_len, n_chunks)
+        weights = F.fold(window_ones, output_size=(1, T_pad), kernel_size=(1, win_len), stride=(1, hop_len))
+
+        return (output / (weights + 1e-8)).squeeze(2)[..., :T_orig]
 
     def __interpolate_and_generate_cfm_loss(self, noisy_stft: torch.Tensor, clean_stft: torch.Tensor):
         # Get data shapes
@@ -191,7 +380,8 @@ class CFMModule(pL.LightningModule):
         v_pred = self.model(model_input, t)  # (B, 2, F, T)
 
         # Calculamos a perda entre o que a rede previu e os dois pontos originais
-        return cfm_loss(v_pred=v_pred, x_0=noisy_stft, x_1=clean_stft), v_pred
+        weight = torch.clamp(torch.pow(1 - t_expand, 2) / (torch.pow(t_expand, 2) + 1e-5), max=self.snr_min_val)
+        return cfm_loss(v_pred=v_pred, x_0=noisy_stft, x_1=clean_stft, weight=weight), v_pred
 
     def configure_optimizers(self):
         # AdamW é o padrão-ouro para Continuous Flow Matching e U-Nets
@@ -213,11 +403,6 @@ class CFMModule(pL.LightningModule):
             },
         }
 
-    def forward(self, noisy_stft: torch.Tensor, n_steps: int | None = None):
-        n_steps = n_steps or self.ode_test_steps
-        return ode_solve(self.model, noisy_stft, n_steps=n_steps)
-
-
 
 if __name__ == "__main__":
     from src.data.datamodule import VBDMDDataModule
@@ -232,6 +417,7 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
 
     noisy_cropped, clean_cropped, noisy_stft, clean_stft, mean, std = next(iter(dataloader))
+    noisy_cropped, clean_cropped = next(iter(dataloader))  # Agora o dataloader retorna apenas wavs
 
     # Movemos todos os elementos do batch para o device
     batch = (
@@ -245,32 +431,7 @@ if __name__ == "__main__":
 
     # 1. Instanciar o módulo
     with torch.device(device):
-        module = CFMModule(
-            in_channels=CFG.data.input_channels,
-            out_channels=CFG.data.output_channels,
-            time_emb_dim=CFG.model.time_emb_dim,
-            projection_dim=CFG.model.projection_dim,
-            n_blocks=CFG.model.n_blocks,
-            compression_factor=CFG.model.compression_factor,
-            channels_factor=CFG.model.channels_factor,
-            num_heads=CFG.model.num_heads,
-            ff_mult=CFG.model.ff_mult,
-            n_groups=CFG.model.n_groups,
-            gradient_checkpointing=CFG.model.gradient_checkpointing,
-            ode_val_steps=CFG.ode.val_steps,
-            ode_test_steps=CFG.ode.test_steps,
-            audio_length_seconds=CFG.audio.audio_length_seconds,
-            audio_sample_rate=CFG.audio.sample_rate,
-            fft_size=CFG.audio.fft_size,
-            hop_length=CFG.audio.hop_length,
-            window_size=CFG.audio.window_size,
-            alpha=CFG.audio.alpha,
-            lr=CFG.training.optim.lr,
-            weight_decay=CFG.training.optim.weight_decay,
-            pct_start=CFG.training.optim.pct_start,
-            validation_slow_metrics_pct=CFG.training.validation_slow_metrics_pct,
-            n_audios_to_log=CFG.logging.n_audios,
-        )
+        module = CFMModule(cfg=CFG)
         batch_size = CFG.data.batch_size
 
         print(f"\n{'=' * 50}")

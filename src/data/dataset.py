@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import Dataset
 import torchaudio
 
-from src.data.transforms import preprocess_item
+from src.data.transforms import pad_or_crop
 from src.utils.settings import AudioConfig
 
 
@@ -13,10 +13,8 @@ class VBDMDDataset(Dataset):
     """VoiceBank-DEMAND dataset wrapper.
 
     Each sample returns:
-        noisy_stft  - (2, F, T) real tensor  [real, imag] of compressed noisy STFT
-        clean_stft  - (2, F, T) real tensor  [real, imag] of compressed clean STFT
-        mean        - scalar tensor (z-score mean)
-        std         - scalar tensor (z-score std)
+        noisy  - (1, T) waveform tensor
+        clean  - (1, T) waveform tensor
     """
 
     def __init__(
@@ -25,17 +23,19 @@ class VBDMDDataset(Dataset):
         hf_repo: str,
         audio_cfg: AudioConfig,
         cache_dir: str | None = None,
-        pad_crop: bool = True,
+        length: int = 0,
+        pad_or_crop: bool = False,
     ) -> None:
         super().__init__()
         self.audio_cfg = audio_cfg
         self.ds = load_dataset(hf_repo, split=split, cache_dir=cache_dir)
-        self.pad_crop = pad_crop
+        self.length = length
+        self.pad_or_crop = pad_or_crop
 
     def __len__(self) -> int:
         return len(self.ds)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         item = self.ds[idx]
 
         noisy_audio = item["noisy"]["array"]
@@ -51,16 +51,10 @@ class VBDMDDataset(Dataset):
             noisy = resampler(noisy)
             clean = resampler(clean)
 
-        return preprocess_item(
-            noisy_audio=noisy,
-            clean_audio=clean,
-            pad_crop=self.pad_crop,
-            length=self.audio_cfg.audio_length_seconds * self.audio_cfg.sample_rate,
-            fft_size=self.audio_cfg.fft_size,
-            hop_length=self.audio_cfg.hop_length,
-            window_size=self.audio_cfg.window_size,
-            alpha=self.audio_cfg.alpha,
-        )
+        if self.pad_or_crop:
+            noisy, clean = pad_or_crop(self.length, noisy, clean)
+
+        return noisy, clean
 
 
 if __name__ == "__main__":
@@ -77,4 +71,3 @@ if __name__ == "__main__":
     print(len(dataset))
     print(dataset[0][0].shape)
     print(dataset[0][1].shape)
-    print(dataset[0][2])

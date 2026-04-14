@@ -1,4 +1,3 @@
-from einops import rearrange
 import torch
 
 
@@ -12,7 +11,10 @@ def complex_to_channels(spec: torch.Tensor) -> torch.Tensor:
     Returns:
         torch.Tensor: 2-channel real STFT of shape (2, F, T)
     """
-    return torch.cat((spec.real, spec.imag), dim=0)
+    if spec.ndim == 3:  # (B, F, T)
+        return torch.stack([spec.real, spec.imag], dim=1)  # (B, 2, F, T)
+    # Fallback para (F, T)
+    return torch.stack([spec.real, spec.imag], dim=0)
 
 
 def channels_to_complex(spec: torch.Tensor) -> torch.Tensor:
@@ -21,7 +23,10 @@ def channels_to_complex(spec: torch.Tensor) -> torch.Tensor:
     Aceita formato com batch (B, 2, F, T) ou sem batch (2, F, T).
     """
     # Formato (B, 2, F, T)
-    return torch.complex(spec[:, 0, ...], spec[:, 1, ...])
+    if spec.ndim == 4:
+        return torch.complex(spec[:, 0, ...], spec[:, 1, ...])
+    # Formato (2, F, T)
+    return torch.complex(spec[0, ...], spec[1, ...])
 
 
 def pad_or_crop(length: int, *signals: torch.Tensor) -> tuple[torch.Tensor, ...]:
@@ -39,7 +44,9 @@ def pad_or_crop(length: int, *signals: torch.Tensor) -> tuple[torch.Tensor, ...]
     return tuple(torch.nn.functional.pad(s, (0, length - s.shape[-1])) for s in signals)
 
 
-def z_score_normalize(noisy: torch.Tensor, clean: torch.Tensor, eps: float = 1e-8) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def z_score_normalize(
+    noisy: torch.Tensor, clean: torch.Tensor, eps: float = 1e-8
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Normalize both noisy and clean audios using Z-score (mean and std) of the noisy signal.
 
     Args:
@@ -50,9 +57,14 @@ def z_score_normalize(noisy: torch.Tensor, clean: torch.Tensor, eps: float = 1e-
     Returns:
         tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: Normalized noisy, clean, mean, and std.
     """
-    mean = noisy.mean()
-    std = noisy.std()
-    return (noisy - mean) / (std + eps), (clean - mean) / (std + eps), mean, std
+    # Calcula média e std por amostra no batch (dimensões de tempo)
+    dims = tuple(range(1, noisy.ndim))
+    mean = noisy.mean(dim=dims, keepdim=True)
+    std = noisy.std(dim=dims, keepdim=True)
+
+    noisy_norm = (noisy - mean) / (std + eps)
+    clean_norm = (clean - mean) / (std + eps)
+    return noisy_norm, clean_norm, mean.squeeze(), std.squeeze()
 
 
 def power_law_compress(spec: torch.Tensor, alpha: float) -> torch.Tensor:
@@ -63,9 +75,11 @@ def power_law_compress(spec: torch.Tensor, alpha: float) -> torch.Tensor:
         alpha (float): Compression exponent
 
     Returns:
-        torch.Tensor: Compressed spectrogram of shape (2, F, T)
+    torch.Tensor: Compressed complex spectrogram.
     """
-    return torch.pow(spec, alpha)
+    mag = torch.abs(spec)
+    phase = torch.angle(spec)
+    return torch.polar(torch.pow(mag, alpha), phase)
 
 
 def power_law_decompress(compressed_spec: torch.Tensor, alpha: float) -> torch.Tensor:
@@ -90,6 +104,10 @@ def signal_to_stft(
     window_size: int,
     alpha: float,
 ) -> torch.Tensor:
+    # torch.stft expects 1D or 2D. We squeeze the channel dimension if present.
+    if signal.ndim == 3:
+        signal = signal.squeeze(1)
+
     # STFT → complex (F, T)
     window = torch.hann_window(window_size).to(signal.device)
     spec = torch.stft(
@@ -153,8 +171,10 @@ def stft_to_waveform(
     """
     spec = channels_to_complex(spec)
 
-    # 2. Desfaz a compressão
-    spec = power_law_decompress(spec, alpha)
+    # 2. Desfaz a compressão (Polar não aceita batch nativamente em versões antigas, mas torch.complex sim)
+    mag = torch.abs(spec) ** (1.0 / alpha)
+    phase = torch.angle(spec)
+    spec = torch.polar(mag, phase)
 
     # 3. iSTFT
     window = torch.hann_window(window_size).to(spec.device)
@@ -169,6 +189,10 @@ def stft_to_waveform(
     )
 
     # 4. Desfaz o z-score normalize: x = (z * std) + mean
-    waveform = waveform * rearrange(std, "B -> B 1") + rearrange(mean, "B -> B 1")
+    waveform = waveform * std.view(-1, 1) + mean.view(-1, 1) if std.ndim > 0 else waveform * std + mean
+
+    # Restore Channel dimension: (B, T) -> (B, 1, T) for OLA and consistency
+    if waveform.ndim == 2:
+        waveform = waveform.unsqueeze(1)
 
     return waveform

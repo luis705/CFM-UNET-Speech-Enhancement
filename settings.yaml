@@ -4,7 +4,7 @@ dataset:
 
 data:
   # Data loader
-  batch_size: 20
+  batch_size: 24
   num_workers: 8
 
   # Model I/O
@@ -27,35 +27,52 @@ audio:
 
 model:
   time_emb_dim: 128
-  projection_dim: 32
-  n_blocks: 4
+  projection_dim: 24
+  n_blocks: 3
   compression_factor: 2
   channels_factor: 2
   num_heads: 4
-  ff_mult: 3
-  n_groups: 16
+  ff_mult: 2
+  n_groups: 8
   gradient_checkpointing: true
 
 ode:
-  val_steps: 10
-  test_steps: 50
+  val_steps: 1
+  test_steps: 5
 
 logging:
   log_dir: tb_logs
   n_audios: 4
+  histogram_logging_frequency: 100
 
 training:
-  early_stop_patience: 5
+  early_stop_patience: 30
+  early_stop_min_epochs: 20
   precision: "bf16-mixed"
   max_epochs: 100
-  accum_batches: 2
+  accum_batches: 1
   grad_clip: 1.0
-  validation_slow_metrics_pct: 0.1
-  histogram_logging_frequency: 100
-  val_interval: 1.0
+  validation_slow_metrics_pct: 0.05
+  val_interval: 0.5
 
   # Optimizer
   optim:
     lr: 2e-4
     weight_decay: 1e-5
     pct_start: 0.1
+
+  losses:
+    cfm:
+      lambda_value: 1.0
+      snr_min_val: 5.0
+
+    mrstft:
+      fft_sizes: [512, 1024, 2048]
+      hop_sizes: [120, 240, 480]
+      win_sizes: [512, 1024, 2048]
+      lambda_max: 0.05
+      start_epoch: 2
+      end_epoch: 20
+
+test:
+  save_dir: "test_results/samples"

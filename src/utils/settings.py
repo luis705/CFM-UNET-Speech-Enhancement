@@ -35,17 +35,40 @@ class OptimConfig(BaseSettings):
     pct_start: float
 
 
+class MRSTFTConfig(BaseSettings):
+    fft_sizes: list[int] = [512, 1024, 2048]
+    hop_sizes: list[int] = [120, 240, 480]
+    win_sizes: list[int] = [600, 1200, 2400]
+    lambda_max: float = 0.1
+    start_epoch: int = 2
+    end_epoch: int = 12
+
+
+class CFMLossConfig(BaseSettings):
+    lambda_value: float
+    snr_min_val: float
+
+
+class LossConfig(BaseSettings):
+    cfm: CFMLossConfig
+    mrstft: MRSTFTConfig
+
+class TestConfig(BaseSettings):
+    save_dir: str
+
+
 class TrainingConfig(BaseSettings):
     early_stop_patience: int
+    early_stop_min_epochs: int
     max_epochs: int
     precision: str
     accum_batches: int
     grad_clip: float
     validation_slow_metrics_pct: float
-    histogram_logging_frequency: int
     val_interval: float | int
 
     optim: OptimConfig
+    losses: LossConfig
 
 
 class ModelConfig(BaseSettings):
@@ -76,6 +99,7 @@ class OdeConfig(BaseSettings):
 class LoggingConfig(BaseSettings):
     log_dir: str
     n_audios: int
+    histogram_logging_frequency: int
 
 
 class Settings(BaseSettings):
@@ -86,6 +110,7 @@ class Settings(BaseSettings):
     ode: OdeConfig
     training: TrainingConfig
     logging: LoggingConfig
+    test: TestConfig
 
 
 CFG_VALUE = None

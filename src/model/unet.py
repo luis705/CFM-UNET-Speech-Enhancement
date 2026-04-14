@@ -88,6 +88,27 @@ class CFMUnet(nn.Module):
             nn.Conv2d(projection_dim, out_channels, kernel_size=3, padding=1),
         )
 
+        # Inicialização customizada
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m: nn.Module) -> None:
+        """Inicializa pesos e vieses, com suporte especial para camadas FiLM identity."""
+        if getattr(m, "final_film", False):
+            # Inicializa com zeros para que gamma=0 e beta=0, tornando o FiLM uma identidade no início
+            if hasattr(m, "weight") and m.weight is not None:
+                nn.init.zeros_(m.weight)
+            if hasattr(m, "bias") and m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, (nn.Conv2d, nn.Linear)):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, (nn.GroupNorm, nn.LayerNorm)):
+            if hasattr(m, "weight") and m.weight is not None:
+                nn.init.ones_(m.weight)
+            if hasattr(m, "bias") and m.bias is not None:
+                nn.init.zeros_(m.bias)
+
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         if self.training and self.gradient_checkpointing and not x.requires_grad:
             x.requires_grad_(True)

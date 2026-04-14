@@ -44,7 +44,6 @@ def compute_wb_pesq(ref: torch.Tensor, deg: torch.Tensor, sr: int = 16000) -> fl
     return np.mean(results)
 
 
-
 def compute_estoi(ref: torch.Tensor, deg: torch.Tensor, sr: int = 16000) -> float:
     """Compute Extended Short-Time Objective Intelligibility (ESTOI).
 
@@ -66,14 +65,14 @@ def compute_estoi(ref: torch.Tensor, deg: torch.Tensor, sr: int = 16000) -> floa
 
     ref_np = ref.detach().cpu().numpy().astype(np.float64)
     deg_np = deg.detach().cpu().numpy().astype(np.float64)
-    
+
     results = []
     for r, d in zip(ref_np, deg_np, strict=True):
         try:
             results.append(stoi(r, d, sr))
         except Exception as e:
             logger.warning(f"Error occurred while computing ESTOI for a sample: {e}")
-            results.append(1.0) 
+            results.append(1.0)
     return np.mean(results)
 
 

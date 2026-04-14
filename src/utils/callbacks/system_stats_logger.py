@@ -27,14 +27,12 @@ class SystemStatsLoggerCallback(pl.Callback):
         cpu = psutil.cpu_percent(interval=None)
         ram = psutil.virtual_memory().percent
         gpus = GPUtil.getGPUs()
+        gpu_util, vram, temp = 0.0, 0.0, 0.0
         if gpus:
             gpu = gpus[0]
             gpu_util = gpu.load * 100
             vram = gpu.memoryUtil * 100
             temp = gpu.temperature
-        else:
-            gpu_util = 0.0
-            vram = 0.0
 
         pl_module.log("perf/batch_time", t, on_step=True, logger=True, prog_bar=False)
         pl_module.log("perf/eta", eta, on_step=True, logger=True, prog_bar=False)

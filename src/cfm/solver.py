@@ -12,12 +12,12 @@ def ode_solve(model: torch.nn.Module, noisy_stft: torch.Tensor, n_steps: int = 1
     # Em t=0, o nosso estado inicial é o áudio ruidoso
     x_t = noisy_stft.clone()
 
-    # Criamos o vetor de tempo de 0 até 1
-    t_span = torch.linspace(0.0, 1.0, n_steps, device=device)
-    dt = t_span[1] - t_span[0]  # O tamanho do passo temporal
+    # CORREÇÃO 1: N passos precisam de N+1 pontos no tempo!
+    t_span = torch.linspace(0.0, 1.0, n_steps + 1, device=device)
+    dt = t_span[1] - t_span[0]  # Agora não dá mais erro de índice com n_steps=1
 
-    # Loop de integração de Euler
-    for i in range(n_steps - 1):
+    # CORREÇÃO 2: O loop roda exatamente n_steps vezes
+    for i in range(n_steps):
         # O tempo atual no formato que o SinusoidalEmbedding espera: (B,)
         t_current = t_span[i].expand(B)
 

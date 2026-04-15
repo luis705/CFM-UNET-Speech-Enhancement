@@ -4,20 +4,27 @@ import torch
 import torch.nn.functional as F
 from torchmetrics.functional.audio import scale_invariant_signal_distortion_ratio, deep_noise_suppression_mean_opinion_score
 
-from src.cfm.loss import MRSTFTLoss, cfm_loss
+from src.cfm.loss import MRSTFTLoss, MelSpectralLoss, cfm_loss
 from src.cfm.solver import ode_solve
-from src.data.transforms import preprocess_item, signal_to_stft, stft_to_waveform
+from src.data.transforms import preprocess_item, signal_to_stft, stft_to_waveform, signal_to_mel
 from src.model.unet import CFMUnet
 from src.utils.metrics import compute_estoi, compute_wb_pesq
 from src.utils.settings import Settings
 
 
 class CFMModule(pL.LightningModule):
-    def __init__(self, cfg: Settings):
+    def __init__(self, cfg: Settings, input_mel: bool = False):
         super().__init__()
-        # Salva as configurações para o logger (TensorBoard/WandB) e checkpoints
-        self.save_hyperparameters(cfg.model_dump())
         self.cfg = cfg
+        self.input_mel = input_mel
+
+        # Mel & Vocoder
+        if self.input_mel:
+            from transformers import HiFiGanModel
+            self.vocoder = HiFiGanModel.from_pretrained(cfg.audio.mel.vocoder_model_path)
+            self.vocoder.eval()
+            for p in self.vocoder.parameters():
+                p.requires_grad = False
 
         self.model = CFMUnet(
             in_channels=cfg.data.input_channels,
@@ -32,6 +39,8 @@ class CFMModule(pL.LightningModule):
             n_groups=cfg.model.n_groups,
             gradient_checkpointing=cfg.model.gradient_checkpointing,
         )
+
+        self.save_hyperparameters(cfg.model_dump())
 
         # ODE
         self.ode_val_steps = cfg.ode.val_steps
@@ -70,6 +79,7 @@ class CFMModule(pL.LightningModule):
             cfg.training.losses.mrstft.hop_sizes,
             cfg.training.losses.mrstft.win_sizes,
         )
+        self.mel_loss_func = MelSpectralLoss()
 
         # Waveform input: (Batch, Channels, Time)
         self.example_input_array = torch.zeros(1, 1, self.audio_length_seconds * self.audio_sample_rate)
@@ -87,6 +97,9 @@ class CFMModule(pL.LightningModule):
             hop_length=self.hop_length,
             window_size=self.window_size,
             alpha=self.alpha,
+            input_mel=self.input_mel,
+            mel_cfg=self.cfg.audio.mel.model_dump() if self.input_mel else None,
+            sample_rate=self.audio_sample_rate,
         )
 
         cfm_l, v_pred = self.__interpolate_and_generate_cfm_loss(noisy_stft, clean_stft)
@@ -96,16 +109,19 @@ class CFMModule(pL.LightningModule):
 
         if lambda_mrstft > 0:
             est_clean_stft = noisy_stft + v_pred
-            est_clean_wav = stft_to_waveform(
-                est_clean_stft,
-                length=self.audio_length_seconds * self.audio_sample_rate,
-                fft_size=self.fft_size,
-                hop_length=self.hop_length,
-                window_size=self.window_size,
-                alpha=self.alpha,
-                mean=mean,
-                std=std,
-            )
+            if self.input_mel:
+                mr_l = self.mel_loss_func(est_clean_stft, clean_stft)
+            else:
+                est_clean_wav = stft_to_waveform(
+                    est_clean_stft,
+                    length=self.audio_length_seconds * self.audio_sample_rate,
+                    fft_size=self.fft_size,
+                    hop_length=self.hop_length,
+                    window_size=self.window_size,
+                    alpha=self.alpha,
+                    mean=mean,
+                    std=std,
+                )
             # MRSTFTLoss espera (B, T)
             mr_l = self.mrstft_loss_func(est_clean_wav, clean_wav_p.squeeze(1))
 
@@ -135,6 +151,9 @@ class CFMModule(pL.LightningModule):
             hop_length=self.hop_length,
             window_size=self.window_size,
             alpha=self.alpha,
+            input_mel=self.input_mel,
+            mel_cfg=self.cfg.audio.mel.model_dump() if self.input_mel else None,
+            sample_rate=self.audio_sample_rate,
         )
 
         # Cálculo da Loss (Sempre feito para monitorar convergência)
@@ -144,16 +163,19 @@ class CFMModule(pL.LightningModule):
 
         if lambda_mrstft > 0:
             est_clean_stft = noisy_stft_crop + v_pred
-            est_clean_wav = stft_to_waveform(
-                est_clean_stft,
-                length=self.audio_length_seconds * self.audio_sample_rate,
-                fft_size=self.fft_size,
-                hop_length=self.hop_length,
-                window_size=self.window_size,
-                alpha=self.alpha,
-                mean=mean,
-                std=std,
-            )
+            if self.input_mel:
+                mr_l = self.mel_loss_func(est_clean_stft, clean_stft_crop)
+            else:
+                est_clean_wav = stft_to_waveform(
+                    est_clean_stft,
+                    length=self.audio_length_seconds * self.audio_sample_rate,
+                    fft_size=self.fft_size,
+                    hop_length=self.hop_length,
+                    window_size=self.window_size,
+                    alpha=self.alpha,
+                    mean=mean,
+                    std=std,
+                )
             mr_l = self.mrstft_loss_func(est_clean_wav, clean_wav_p.squeeze(1))
 
         else:
@@ -219,7 +241,23 @@ class CFMModule(pL.LightningModule):
         # Garante o alinhamento caso haja pequenas diferenças residuais do OLA
         T_target = enhanced_wav.shape[-1]
         clean_wav_aligned = clean_wav[..., :T_target]
-        clean_stft = signal_to_stft(clean_wav_aligned, self.fft_size, self.hop_length, self.window_size, self.alpha)
+
+        if self.input_mel:
+            mel_params = self.cfg.audio.mel.model_dump()
+            mel_params.pop("vocoder_model_path", None)
+            enhanced_stft = signal_to_mel(
+                enhanced_wav, self.audio_sample_rate, 
+                n_fft=self.fft_size, hop_length=self.hop_length, win_length=self.window_size,
+                **mel_params
+            )
+            clean_stft = signal_to_mel(
+                clean_wav_aligned, self.audio_sample_rate,
+                n_fft=self.fft_size, hop_length=self.hop_length, win_length=self.window_size,
+                **mel_params
+            )
+        else:
+            enhanced_stft = signal_to_stft(enhanced_wav, self.fft_size, self.hop_length, self.window_size, self.alpha)
+            clean_stft = signal_to_stft(clean_wav_aligned, self.fft_size, self.hop_length, self.window_size, self.alpha)
 
         # Cálculo individual por áudio no batch para granularidade total
         B = noisy_wav.shape[0]
@@ -282,7 +320,7 @@ class CFMModule(pL.LightningModule):
             individual_metrics.append(res)
 
             # Salva no buffer de áudio (LoggingCallback) se ainda houver espaço
-            if len(buffer) < self.n_audios_to_log:
+            if len(buffer) < self.n_audios_to_log or log_suffix == "test":
                 buffer.append(
                     {
                         "clean": s_clean.detach().cpu(),
@@ -328,6 +366,9 @@ class CFMModule(pL.LightningModule):
             hop_length=self.hop_length,
             window_size=self.window_size,
             alpha=self.alpha,
+            input_mel=self.input_mel,
+            mel_cfg=self.cfg.audio.mel.model_dump() if self.input_mel else None,
+            sample_rate=self.audio_sample_rate,
         )
 
         # 4. Modelo (ODE)
@@ -345,6 +386,22 @@ class CFMModule(pL.LightningModule):
             mean=mean,
             std=std,
         )
+        # 5. iSTFT ou Vocoder + Desnormalização Local
+        if self.input_mel:
+            enhanced_chunks = self.vocoder(enhanced_stft_chunks.squeeze(1)).waveforms
+            enhanced_chunks = enhanced_chunks * std.view(-1, 1) + mean.view(-1, 1)
+            enhanced_chunks = enhanced_chunks.unsqueeze(1)
+        else:
+            enhanced_chunks = stft_to_waveform(
+                enhanced_stft_chunks,
+                length=win_len,
+                fft_size=self.fft_size,
+                hop_length=self.hop_length,
+                window_size=self.window_size,
+                alpha=self.alpha,
+                mean=mean,
+                std=std,
+            )
 
         # 6. Reconstrução Eficiente com Fold
         # Aplicamos a janela de Hann para crossfade

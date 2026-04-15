@@ -9,7 +9,7 @@ import matplotlib
 import torch
 
 # Ensure project root is on sys.path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import pytorch_lightning as pL
 from pytorch_lightning.callbacks import (
@@ -47,7 +47,7 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     with torch.device(device):
-        model = CFMModule(settings)
+        model = CFMModule(settings, input_mel=True)
 
     # Logger
     tb_logger = TensorBoardLogger(

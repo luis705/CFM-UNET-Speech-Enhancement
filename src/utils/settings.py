@@ -17,6 +17,13 @@ class DataConfig(BaseSettings):
     val_split: float
 
 
+class MelConfig(BaseSettings):
+    n_mels: int = 80
+    f_min: float = 0
+    f_max: float | None = 8000
+    vocoder_model_path: str = "speechbrain/tts-hifigan-libritts-16kHz"
+
+
 class AudioConfig(BaseSettings):
     # Signal settings
     sample_rate: int
@@ -27,6 +34,7 @@ class AudioConfig(BaseSettings):
     window_size: int
     # Power law compression settings
     alpha: float
+    mel: MelConfig | None = None
 
 
 class OptimConfig(BaseSettings):

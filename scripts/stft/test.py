@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 
 # Ensure project root is on sys.path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import pytorch_lightning as L
 from pytorch_lightning.callbacks import (

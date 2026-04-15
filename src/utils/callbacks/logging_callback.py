@@ -14,6 +14,7 @@ import torch
 import torchaudio
 from torchvision.transforms import ToTensor
 from torchvision.utils import save_image
+from src.data.transforms import signal_to_mel
 
 
 class LoggingCallback(pl.Callback):
@@ -141,9 +142,24 @@ class LoggingCallback(pl.Callback):
             # Se o módulo estiver operando em modo Mel, os tensores no buffer são espectrogramas
             if getattr(pl_module, "input_mel", False):
                 with torch.no_grad():
-                    clean = pl_module.vocoder(clean.to(pl_module.device).unsqueeze(0)).waveforms.squeeze(0).cpu()
-                    noisy = pl_module.vocoder(noisy.to(pl_module.device).unsqueeze(0)).waveforms.squeeze(0).cpu()
-                    enhanced = pl_module.vocoder(enhanced.to(pl_module.device).unsqueeze(0)).waveforms.squeeze(0).cpu()
+                    mel_cfg = pl_module.cfg.audio.mel.model_dump()
+                    def to_vocoded(wav):
+                        # Converte waveform para mel (formato esperado pelo signal_to_mel)
+                        mel_params = {k: v for k, v in mel_cfg.items() if k != "vocoder_model_path"}
+                        m = signal_to_mel(
+                            wav.unsqueeze(0).to(pl_module.device), 
+                            pl_module.audio_sample_rate, 
+                            n_fft=pl_module.fft_size,
+                            hop_length=pl_module.hop_length,
+                            win_length=pl_module.window_size,
+                            **mel_params
+                        ) # Resulta em (1, 1, Mels, T)
+                        # Transpõe para (1, T, Mels) e vocoda
+                        return pl_module.vocoder(m.squeeze(1).transpose(1, 2)).waveforms.squeeze(0).cpu()
+
+                    clean = to_vocoded(clean)
+                    noisy = to_vocoded(noisy)
+                    enhanced = to_vocoded(enhanced)
 
             if tb is not None:
                 for group_metrics in metrics.values():
@@ -252,7 +268,11 @@ class LoggingCallback(pl.Callback):
             ("enhanced_clean", spec_enhanced_clean),
             ("clean_noisy", spec_clean_noisy),
         ]:
-            img = (spec - spec.min()) / (spec.max() - spec.min() + 1e-8)
+            # Escala dB fixa para comparação consistente (-80 a 0 dB)
+            v_min, v_max = -80.0, 0.0
+            img = (spec - v_min) / (v_max - v_min + 1e-8)
+            img = torch.clamp(img, 0, 1)
+
             if tb is not None:
                 tb.add_image(f"{tb_preffix}_{suffix}/spec_{tag}", img, step)
             if local_path:

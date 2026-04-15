@@ -50,7 +50,7 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     with torch.device(device):
-        model = CFMModule.load_from_checkpoint(args.checkpoint, cfg=settings)
+        model = CFMModule.load_from_checkpoint(args.checkpoint, cfg=settings, input_mel=True)
 
 
     # Callbacks

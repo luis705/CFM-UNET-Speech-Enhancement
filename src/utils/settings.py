@@ -15,6 +15,8 @@ class DataConfig(BaseSettings):
     input_channels: int
     output_channels: int
     val_split: float
+    augment: bool = False
+    augment_pct: float = 0
 
 
 class MelConfig(BaseSettings):

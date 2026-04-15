@@ -252,3 +252,52 @@ def stft_to_waveform(
 
     return waveform
 
+
+def add_stochastic_noise(signal: torch.Tensor, min_snr_db: float = 10.0, max_snr_db: float = 25.0) -> torch.Tensor:
+    """Adiciona ruído estocástico (branco, rosa ou castanho) ao sinal com um SNR aleatório."""
+    
+    # Sorteia a cor do ruído: 0 (branco), 1 (rosa), 2 (castanho)
+    # Ruído branco: gaussiana normal
+    # Ruído rosa: 1/f -> flicker noise: transistores e semicondutores
+    # Ruído castanho: f -> Vibrações mecânicas: vento batendo, microfone balançando, rumble de sala
+
+    beta = torch.randint(0, 3, (1,)).item()
+    
+    N = signal.shape[-1]
+    noise = torch.randn_like(signal)
+    
+    # Se beta > 0, moldamos o espetro para criar ruído rosa (1) ou castanho (2)
+    if beta > 0:
+        # Passa para o domínio da frequência
+        X = torch.fft.rfft(noise)
+        freqs = torch.fft.rfftfreq(N, device=signal.device)
+        
+        # Evita a divisão por zero na componente DC (frequência 0)
+        freqs[0] = 1.0 
+        
+        # Calcula a amplitude: decai com a frequência com base no beta
+        amplitude = 1.0 / (freqs ** (beta / 2.0))
+        amplitude[0] = 0.0  # Remove o offset DC
+        
+        # Aplica o filtro e regressa ao domínio do tempo
+        Y = X * amplitude
+        noise = torch.fft.irfft(Y, n=N)
+        
+        # Normaliza o ruído gerado para garantir estabilidade no cálculo da potência
+        noise = noise / (torch.std(noise) + 1e-8)
+    
+    # Calcula a potência do sinal e do ruído
+    signal_power = torch.mean(signal ** 2)
+    noise_power = torch.mean(noise ** 2)
+    
+    # Evita divisão por zero se o sinal for silêncio absoluto
+    if signal_power == 0:
+        return signal
+        
+    # Sorteia um SNR alvo para esta amostra
+    target_snr = torch.empty(1).uniform_(min_snr_db, max_snr_db).item()
+    
+    # Calcula o fator de escala para atingir o SNR desejado
+    scale = torch.sqrt(signal_power / noise_power) * (10.0 ** (-target_snr / 20.0))
+    
+    return signal + (noise * scale)

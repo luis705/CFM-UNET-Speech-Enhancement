@@ -27,6 +27,8 @@ class VBDMDDataModule(pl.LightningDataModule):
                 cache_dir=cfg.dataset.cache_dir,
                 pad_or_crop=True,
                 length=cfg.audio.audio_length_seconds * cfg.audio.sample_rate,
+                augment=cfg.data.augment,
+                augment_pct=cfg.data.augment_pct,
             )
             n_val = int(len(full_train) * cfg.data.val_split)
             n_train = len(full_train) - n_val
@@ -45,6 +47,7 @@ class VBDMDDataModule(pl.LightningDataModule):
                 audio_cfg=cfg.audio,
                 cache_dir=cfg.dataset.cache_dir,
                 pad_or_crop=False,
+                augment=False,
             )
             # Aplicamos os índices do subset de validação ao dataset sem crop
             self._val_ds = torch.utils.data.Subset(full_val_var_len, val_subset.indices)
@@ -56,6 +59,7 @@ class VBDMDDataModule(pl.LightningDataModule):
                 audio_cfg=cfg.audio,
                 cache_dir=cfg.dataset.cache_dir,
                 pad_or_crop=False,
+                augment=False,
             )
 
     def train_dataloader(self) -> DataLoader:

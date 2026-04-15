@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import Dataset
 import torchaudio
 
-from src.data.transforms import pad_or_crop
+from src.data.transforms import pad_or_crop, add_stochastic_noise
 from src.utils.settings import AudioConfig
 
 
@@ -25,12 +25,17 @@ class VBDMDDataset(Dataset):
         cache_dir: str | None = None,
         length: int = 0,
         pad_or_crop: bool = False,
+        augment: bool = True,
+        augment_pct: float = 0.25,
     ) -> None:
         super().__init__()
         self.audio_cfg = audio_cfg
         self.ds = load_dataset(hf_repo, split=split, cache_dir=cache_dir)
         self.length = length
         self.pad_or_crop = pad_or_crop
+        self.augment = augment
+        self.augment_pct = augment_pct
+
 
     def __len__(self) -> int:
         return len(self.ds)
@@ -53,6 +58,9 @@ class VBDMDDataset(Dataset):
 
         if self.pad_or_crop:
             noisy, clean = pad_or_crop(self.length, noisy, clean)
+
+        if self.augment and torch.rand(1) < self.augment_pct:
+            noisy = add_stochastic_noise(noisy)
 
         return noisy, clean
 

@@ -5,13 +5,11 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
-import matplotlib
-import torch
 
 # Ensure project root is on sys.path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import pytorch_lightning as pL
+import pytorch_lightning as L
 from pytorch_lightning.callbacks import (
     LearningRateMonitor,
     ModelCheckpoint,
@@ -33,11 +31,17 @@ from src.utils.settings import get_settings
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train CFM Speech Enhancement")
     parser.add_argument("--config", type=str, default="settings.yaml", help="Path to settings YAML")
-    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--mel", action="store_true", help="Use mel-spectrograms")
     args = parser.parse_args()
 
-    pL.seed_everything(args.seed)
+    if args.checkpoint is None:
+        raise ValueError("Checkpoint path must be provided")
+
+
+
+    L.seed_everything(args.seed)
     settings = get_settings(args.config)
 
     # Data
@@ -47,27 +51,21 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     with torch.device(device):
-        model = CFMModule(settings, input_mel=True)
+        model = CFMModule.load_from_checkpoint(args.checkpoint, cfg=settings, input_mel=args.mel)
 
-    # Logger
-    tb_logger = TensorBoardLogger(
-        save_dir=settings.logging.log_dir,
-        name="cfm-unet-se-mel",
-        # log_graph=True,
-    )
 
     # Callbacks
     callbacks = [
         ModelCheckpoint(
             dirpath=Path(settings.logging.log_dir) / "checkpoints",
-            filename="epoch={epoch:03d}-sisdr={val_sample/SI_SDR:.3f}",
-            monitor="val_sample/SI_SDR",
+            filename="epoch={epoch:03d}-sisdr={val/SAMPLE_SI_SDR:.3f}",
+            monitor="val/SAMPLE_SI_SDR",
             mode="max",
             save_top_k=3,
             auto_insert_metric_name=False,
         ),
         MinEpochEarlyStopping(
-            monitor="val_sample/SI_SDR",
+            monitor="val/SAMPLE_SI_SDR",
             mode="max",
             patience=settings.training.early_stop_patience,
             min_epochs=settings.training.early_stop_min_epochs,
@@ -85,31 +83,23 @@ def main() -> None:
     ]
 
     # Trainer
-    trainer = pL.Trainer(
+    trainer = L.Trainer(
         accelerator="gpu",
         devices=1,
         precision=settings.training.precision,
-        max_epochs=settings.training.max_epochs,
-        accumulate_grad_batches=settings.training.accum_batches,
-        gradient_clip_val=settings.training.grad_clip,
         callbacks=callbacks,
-        logger=tb_logger,
-        log_every_n_steps=10,
-        val_check_interval=settings.training.val_interval,
+        logger=False,  # Desativa o TensorBoard para salvar APENAS localmente via Callback
     )
 
-    # Training
-    trainer.fit(model, datamodule=datamodule, ckpt_path=args.resume)
-
-    # Test - Carrega automaticamente o melhor checkpoint monitorado pelo ModelCheckpoint
-    # Isso garante que as métricas de teste sejam extraídas do melhor modelo, não do último.
-    print("\n[Train Script] Iniciando avaliação no conjunto de teste com o melhor checkpoint...")
-    results = trainer.test(model=model, datamodule=datamodule, ckpt_path="best")
+    results = trainer.test(model, datamodule=datamodule)
 
     print(results)
 
 
 if __name__ == "__main__":
+    import matplotlib
+    import torch
+
     matplotlib.use("agg")
     torch.set_float32_matmul_precision("high")
     main()

@@ -38,7 +38,7 @@ def compute_wb_pesq(ref: torch.Tensor, deg: torch.Tensor, sr: int = 16000) -> fl
             # A biblioteca pesq exige arrays 1D (T,)
             results.append(pesq(sr, r, d, "wb"))
         except Exception as e:
-            logger.warning(f"Error occurred while computing PESQ for a sample: {e}")
+            # logger.warning(f"Error occurred while computing PESQ for a sample: {e}")
             results.append(1.0)
 
     return np.mean(results)
@@ -71,15 +71,6 @@ def compute_estoi(ref: torch.Tensor, deg: torch.Tensor, sr: int = 16000) -> floa
         try:
             results.append(stoi(r, d, sr))
         except Exception as e:
-            logger.warning(f"Error occurred while computing ESTOI for a sample: {e}")
+            # logger.warning(f"Error occurred while computing ESTOI for a sample: {e}")
             results.append(1.0)
     return np.mean(results)
-
-
-def compute_dnsmos(wav: torch.Tensor, sr: int = 16000) -> dict:
-    """Stub for DNSMOS (not yet implemented).
-
-    Returns a dict with ``None`` for each sub-score.
-    """
-    logger.warning("DNSMOS is not yet implemented — ONNX model files are required. Returning None for all sub-scores.")
-    return {"sig": None, "bak": None, "ovrl": None}

@@ -4,31 +4,27 @@ dataset:
 
 data:
   # Data loader
-  batch_size: 24
+  batch_size: 32
   num_workers: 8
-
-  # Model I/O
-  input_channels: 4
-  output_channels: 2
 
   # Splits
   val_split: 0.1
+
+  # Augmentation
+  augment: True
+  augment_pct: 0.5
 
 
 audio:
   sample_rate: 16000
   audio_length_seconds: 2
   # FFT settings
-  fft_size: 512
-  hop_length: 128
-  window_size: 256
+  fft_size: 1024
+  hop_length: 256
+  window_size: 1024
   # Power law compression settings
   alpha: 0.5
-  mel:
-    vocoder_model_path: "speechbrain/tts-hifigan-libritts-16kHz"
-    n_mels: 80
-    f_min: 0
-    f_max: 8000
+
 
 model:
   time_emb_dim: 128
@@ -47,18 +43,27 @@ ode:
 
 logging:
   log_dir: tb_logs
-  n_audios: 4
+  n_audios: 5
   histogram_logging_frequency: 100
+
+evaluation:
+  val_slow_metrics_percent: 0.05
+  test_slow_metrics_percent: 1.0
+  spk_sim_model_id: "microsoft/wavlm-base-plus-sv"
+  spk_sim_device: "cpu"
+  utmos_hub_repo: "tarepan/SpeechMOS:v1.2.0"
+  utmos_model: "utmos22_strong"
+  utmos_device: "cpu"
 
 training:
   early_stop_patience: 30
   early_stop_min_epochs: 20
   precision: "bf16-mixed"
-  max_epochs: 100
+  max_epochs: 200
   accum_batches: 1
   grad_clip: 1.0
   validation_slow_metrics_pct: 0.05
-  val_interval: 0.5
+  val_interval: 1.0
 
   # Optimizer
   optim:
@@ -81,3 +86,5 @@ training:
 
 test:
   save_dir: "test_results/samples"
+  # Number of test samples saved with clean/noisy audio and every ODE step
+  trajectory_n_audios: 5

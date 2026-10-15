@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings
 import yaml
 
@@ -12,18 +13,9 @@ class DatasetConfig(BaseSettings):
 class DataConfig(BaseSettings):
     batch_size: int
     num_workers: int
-    input_channels: int
-    output_channels: int
     val_split: float
     augment: bool = False
     augment_pct: float = 0
-
-
-class MelConfig(BaseSettings):
-    n_mels: int = 80
-    f_min: float = 0
-    f_max: float | None = 8000
-    vocoder_model_path: str = "speechbrain/tts-hifigan-libritts-16kHz"
 
 
 class AudioConfig(BaseSettings):
@@ -36,7 +28,6 @@ class AudioConfig(BaseSettings):
     window_size: int
     # Power law compression settings
     alpha: float
-    mel: MelConfig | None = None
 
 
 class OptimConfig(BaseSettings):
@@ -65,6 +56,7 @@ class LossConfig(BaseSettings):
 
 class TestConfig(BaseSettings):
     save_dir: str
+    trajectory_n_audios: int = Field(default=4, ge=0)
 
 
 class TrainingConfig(BaseSettings):
@@ -112,6 +104,16 @@ class LoggingConfig(BaseSettings):
     histogram_logging_frequency: int
 
 
+class EvaluationConfig(BaseSettings):
+    val_slow_metrics_percent: float = 0.0
+    test_slow_metrics_percent: float = 1.0
+    spk_sim_model_id: str = "microsoft/wavlm-base-plus-sv"
+    spk_sim_device: str = "cpu"
+    utmos_hub_repo: str = "tarepan/SpeechMOS:v1.2.0"
+    utmos_model: str = "utmos22_strong"
+    utmos_device: str = "cpu"
+
+
 class Settings(BaseSettings):
     dataset: DatasetConfig
     data: DataConfig
@@ -120,6 +122,7 @@ class Settings(BaseSettings):
     ode: OdeConfig
     training: TrainingConfig
     logging: LoggingConfig
+    evaluation: EvaluationConfig = EvaluationConfig()
     test: TestConfig
 
 

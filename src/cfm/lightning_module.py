@@ -1,34 +1,26 @@
+import bitsandbytes as bnb
 from einops import rearrange
 import pytorch_lightning as pL
 import torch
 import torch.nn.functional as F
-from torchmetrics.functional.audio import scale_invariant_signal_distortion_ratio, deep_noise_suppression_mean_opinion_score
+from torchmetrics.functional.audio import scale_invariant_signal_distortion_ratio
 
-from src.cfm.loss import MRSTFTLoss, MelSpectralLoss, cfm_loss
+from src.cfm.loss import MRSTFTLoss, cfm_loss
 from src.cfm.solver import ode_solve
-from src.data.transforms import preprocess_item, signal_to_stft, stft_to_waveform, signal_to_mel
+from src.data.transforms import preprocess_item, signal_to_stft, stft_to_waveform
 from src.model.unet import CFMUnet
 from src.utils.metrics import compute_estoi, compute_wb_pesq
 from src.utils.settings import Settings
 
 
 class CFMModule(pL.LightningModule):
-    def __init__(self, cfg: Settings, input_mel: bool = False):
+    def __init__(self, cfg: Settings):
         super().__init__()
         self.cfg = cfg
-        self.input_mel = input_mel
-
-        # Mel & Vocoder
-        if self.input_mel:
-            from transformers import HiFiGanModel
-            self.vocoder = HiFiGanModel.from_pretrained(cfg.audio.mel.vocoder_model_path)
-            self.vocoder.eval()
-            for p in self.vocoder.parameters():
-                p.requires_grad = False
 
         self.model = CFMUnet(
-            in_channels=cfg.data.input_channels,
-            out_channels=cfg.data.output_channels,
+            in_channels=4,
+            out_channels=2,
             time_emb_dim=cfg.model.time_emb_dim,
             projection_dim=cfg.model.projection_dim,
             n_blocks=cfg.model.n_blocks,
@@ -72,6 +64,7 @@ class CFMModule(pL.LightningModule):
         self.val_audio_buffer = []
         self.test_audio_buffer = []
         self.test_metrics_buffer = []
+        self.test_trajectory_n_audios = cfg.test.trajectory_n_audios
         self._baseline_cache = {}
 
         self.mrstft_loss_func = MRSTFTLoss(
@@ -79,7 +72,6 @@ class CFMModule(pL.LightningModule):
             cfg.training.losses.mrstft.hop_sizes,
             cfg.training.losses.mrstft.win_sizes,
         )
-        self.mel_loss_func = MelSpectralLoss()
 
         # Waveform input: (Batch, Channels, Time)
         self.example_input_array = torch.zeros(1, 1, self.audio_length_seconds * self.audio_sample_rate)
@@ -97,8 +89,6 @@ class CFMModule(pL.LightningModule):
             hop_length=self.hop_length,
             window_size=self.window_size,
             alpha=self.alpha,
-            input_mel=self.input_mel,
-            mel_cfg=self.cfg.audio.mel.model_dump() if self.input_mel else None,
             sample_rate=self.audio_sample_rate,
         )
 
@@ -109,19 +99,16 @@ class CFMModule(pL.LightningModule):
 
         if lambda_mrstft > 0:
             est_clean_stft = noisy_stft + v_pred
-            if self.input_mel:
-                mr_l = self.mel_loss_func(est_clean_stft, clean_stft)
-            else:
-                est_clean_wav = stft_to_waveform(
-                    est_clean_stft,
-                    length=self.audio_length_seconds * self.audio_sample_rate,
-                    fft_size=self.fft_size,
-                    hop_length=self.hop_length,
-                    window_size=self.window_size,
-                    alpha=self.alpha,
-                    mean=mean,
-                    std=std,
-                )
+            est_clean_wav = stft_to_waveform(
+                est_clean_stft,
+                length=self.audio_length_seconds * self.audio_sample_rate,
+                fft_size=self.fft_size,
+                hop_length=self.hop_length,
+                window_size=self.window_size,
+                alpha=self.alpha,
+                mean=mean,
+                std=std,
+            )
             # MRSTFTLoss espera (B, T)
             mr_l = self.mrstft_loss_func(est_clean_wav, clean_wav_p.squeeze(1))
 
@@ -132,13 +119,45 @@ class CFMModule(pL.LightningModule):
 
         self.log("train/loss", loss.detach(), prog_bar=True, on_step=True, on_epoch=True)
         self.log("train/loss_cfm", cfm_l.detach(), on_step=True, on_epoch=True)
-        self.log("train/loss_mrstft", mr_l.detach(), on_step=True, on_epoch=True)
+        self.log("train/loss_mrstft", mr_l.float().detach(), on_step=True, on_epoch=True)
         self.log("train/lambda_mrstft", torch.tensor(lambda_mrstft, device=self.device), on_step=True, on_epoch=True)
 
         return loss
 
-    def validation_step(self, batch, batch_idx):
+    @staticmethod
+    def _unpack_batch(batch):
+        if isinstance(batch, dict):
+            noisy_wav = batch["noisy"]
+            clean_wav = batch["clean"]
+            metadata = {
+                "snr_db": batch.get("snr_db"),
+                "snr_db_estimated": batch.get("snr_db_estimated"),
+                "noise_type": batch.get("noise_type"),
+                "sample_id": batch.get("sample_id"),
+            }
+            return noisy_wav, clean_wav, metadata
+
         noisy_wav, clean_wav = batch
+        return noisy_wav, clean_wav, {}
+
+    @staticmethod
+    def _metadata_at(metadata: dict, key: str, idx: int):
+        value = metadata.get(key)
+        if value is None:
+            return None
+
+        if torch.is_tensor(value):
+            if value.ndim == 0:
+                return value.item()
+            return value[idx].item()
+
+        if isinstance(value, (list, tuple)):
+            return value[idx]
+
+        return value if idx == 0 else None
+
+    def validation_step(self, batch, batch_idx):
+        noisy_wav, clean_wav, metadata = self._unpack_batch(batch)
 
         # 1. Preprocessamento padrão (Crop para cálculo da Loss)
         # Isso garante que a loss de validação seja comparável com a de treino
@@ -151,8 +170,6 @@ class CFMModule(pL.LightningModule):
             hop_length=self.hop_length,
             window_size=self.window_size,
             alpha=self.alpha,
-            input_mel=self.input_mel,
-            mel_cfg=self.cfg.audio.mel.model_dump() if self.input_mel else None,
             sample_rate=self.audio_sample_rate,
         )
 
@@ -163,19 +180,16 @@ class CFMModule(pL.LightningModule):
 
         if lambda_mrstft > 0:
             est_clean_stft = noisy_stft_crop + v_pred
-            if self.input_mel:
-                mr_l = self.mel_loss_func(est_clean_stft, clean_stft_crop)
-            else:
-                est_clean_wav = stft_to_waveform(
-                    est_clean_stft,
-                    length=self.audio_length_seconds * self.audio_sample_rate,
-                    fft_size=self.fft_size,
-                    hop_length=self.hop_length,
-                    window_size=self.window_size,
-                    alpha=self.alpha,
-                    mean=mean,
-                    std=std,
-                )
+            est_clean_wav = stft_to_waveform(
+                est_clean_stft,
+                length=self.audio_length_seconds * self.audio_sample_rate,
+                fft_size=self.fft_size,
+                hop_length=self.hop_length,
+                window_size=self.window_size,
+                alpha=self.alpha,
+                mean=mean,
+                std=std,
+            )
             mr_l = self.mrstft_loss_func(est_clean_wav, clean_wav_p.squeeze(1))
 
         else:
@@ -192,10 +206,22 @@ class CFMModule(pL.LightningModule):
         num_val_batches = self.trainer.num_val_batches[0]
         limit = max(1, int(num_val_batches * self.validation_slow_metrics_pct))
 
+        slow_outputs = None
         if batch_idx < limit:
-            self.process_and_log_metrics(noisy_wav, clean_wav, "val", self.val_audio_buffer, batch_idx)
+            slow_outputs = self.process_and_log_metrics(
+                noisy_wav,
+                clean_wav,
+                "val",
+                self.val_audio_buffer,
+                batch_idx,
+                metadata=metadata,
+            )
 
-        return loss
+        out = {"loss": loss}
+        if slow_outputs is not None:
+            out.update(slow_outputs)
+
+        return out
 
     def _get_lambda_mrstft(self, batch_idx: int) -> float:
         """Calcula o peso da loss MR-STFT com rampa linear a cada passo."""
@@ -222,74 +248,103 @@ class CFMModule(pL.LightningModule):
         return self.mrstft_lambda_max * max(0.0, min(1.0, t))
 
     def test_step(self, batch, batch_idx):
-        noisy_wav, clean_wav = batch
-        metrics_list = self.process_and_log_metrics(noisy_wav, clean_wav, "test", self.test_audio_buffer, batch_idx)
+        noisy_wav, clean_wav, metadata = self._unpack_batch(batch)
+        test_outputs = self.process_and_log_metrics(
+            noisy_wav,
+            clean_wav,
+            "test",
+            self.test_audio_buffer,
+            batch_idx,
+            metadata=metadata,
+        )
+        metrics_list = test_outputs["metrics_list"]
         self.test_metrics_buffer.extend(metrics_list)
+        return test_outputs
 
     def forward(self, x, n_steps: int = None):
         n_steps = n_steps or self.ode_test_steps
         return self.process_ola(x, n_steps=n_steps)
 
-    def process_and_log_metrics(self, noisy_wav: torch.Tensor, clean_wav: torch.Tensor, log_suffix: str, buffer: list, batch_idx: int):
+    def _get_consistent_audio(self, wav: torch.Tensor, key: tuple, name: str) -> torch.Tensor:
+        """Mantém cache de áudio para evitar recomputações de métricas em épocas futuras."""
+        cache_key = f"s_{name}_consistent"
+        if key in self._baseline_cache and cache_key in self._baseline_cache[key]:
+            return self._baseline_cache[key][cache_key].to(self.device)
+
+        consistent = wav
+            
+        if key not in self._baseline_cache:
+            self._baseline_cache[key] = {}
+        
+        # Salva no cache CPU para evitar reprocessamento em épocas futuras (Otimização)
+        self._baseline_cache[key][cache_key] = consistent.squeeze().cpu()
+        return consistent.squeeze().to(self.device)
+
+    def process_and_log_metrics(
+        self,
+        noisy_wav: torch.Tensor,
+        clean_wav: torch.Tensor,
+        log_suffix: str,
+        buffer: list,
+        batch_idx: int,
+        metadata: dict | None = None,
+    ):
         # Roda o OLA no áudio completo
         n_steps = self.ode_val_steps if log_suffix == "val" else self.ode_test_steps
-        enhanced_wav = self.process_ola(noisy_wav, n_steps=n_steps)
-
-        # Para o MSE de áudio, precisamos do STFT do áudio realçado
-        enhanced_stft = signal_to_stft(enhanced_wav, self.fft_size, self.hop_length, self.window_size, self.alpha)
+        trajectory_wavs: dict[float, torch.Tensor] = {}
+        capture_trajectory = log_suffix == "test" and len(buffer) < self.test_trajectory_n_audios
+        if capture_trajectory:
+            ola_out = self.process_ola(
+                noisy_wav,
+                n_steps=n_steps,
+                return_trajectory=True,
+            )
+            enhanced_wav = ola_out["final"]
+            trajectory_wavs = ola_out.get("snapshots", {})
+        else:
+            enhanced_wav = self.process_ola(noisy_wav, n_steps=n_steps)
 
         # Garante o alinhamento caso haja pequenas diferenças residuais do OLA
         T_target = enhanced_wav.shape[-1]
         clean_wav_aligned = clean_wav[..., :T_target]
+        noisy_wav_aligned = noisy_wav[..., :T_target]
 
-        if self.input_mel:
-            mel_params = self.cfg.audio.mel.model_dump()
-            mel_params.pop("vocoder_model_path", None)
-            enhanced_stft = signal_to_mel(
-                enhanced_wav, self.audio_sample_rate, 
-                n_fft=self.fft_size, hop_length=self.hop_length, win_length=self.window_size,
-                **mel_params
-            )
-            clean_stft = signal_to_mel(
-                clean_wav_aligned, self.audio_sample_rate,
-                n_fft=self.fft_size, hop_length=self.hop_length, win_length=self.window_size,
-                **mel_params
-            )
-        else:
-            enhanced_stft = signal_to_stft(enhanced_wav, self.fft_size, self.hop_length, self.window_size, self.alpha)
-            clean_stft = signal_to_stft(clean_wav_aligned, self.fft_size, self.hop_length, self.window_size, self.alpha)
+        B = noisy_wav.shape[0]
+        # Prepara áudios consistentes para o batch (e cacheia para as próximas épocas)
+        clean_consistent_batch = torch.stack([
+            self._get_consistent_audio(clean_wav_aligned[i], (log_suffix, batch_idx, i), "clean") 
+            for i in range(B)
+        ]).unsqueeze(1) # (B, 1, T)
+
+        noisy_consistent_batch = torch.stack([
+            self._get_consistent_audio(noisy_wav_aligned[i], (log_suffix, batch_idx, i), "noisy")
+            for i in range(B)
+        ]).unsqueeze(1)
+
+        enhanced_stft = signal_to_stft(enhanced_wav, self.fft_size, self.hop_length, self.window_size, self.alpha)
+        clean_stft = signal_to_stft(clean_consistent_batch, self.fft_size, self.hop_length, self.window_size, self.alpha)
 
         # Cálculo individual por áudio no batch para granularidade total
-        B = noisy_wav.shape[0]
         individual_metrics = []
-
-        dnsmos = deep_noise_suppression_mean_opinion_score(enhanced_wav, self.audio_sample_rate, personalized=True)
-        dnsmos_noisy = deep_noise_suppression_mean_opinion_score(noisy_wav, self.audio_sample_rate, personalized=True)
-        dnsmos_clean = deep_noise_suppression_mean_opinion_score(clean_wav_aligned, self.audio_sample_rate, personalized=True)
 
         for i in range(B):
             s_enhanced = enhanced_wav[i]
-            s_clean = clean_wav_aligned[i]
-            s_noisy = noisy_wav[i]
+            s_clean_ref = clean_consistent_batch[i].squeeze(0)
+            s_noisy_ref = noisy_consistent_batch[i].squeeze(0)
 
             # --- Baseline Metrics (Cached) ---
-            # Identificador único por split e amostra para evitar colisões
             sample_key = (log_suffix, batch_idx, i)
-            
-            if sample_key not in self._baseline_cache:
-                # DNSMOS para noisy e clean (cálculo pesado feito apenas 1 vez)
-                
-                self._baseline_cache[sample_key] = {
-                    "PESQ_NOISY": float(compute_wb_pesq(s_noisy, s_clean)),
-                    "STOI_NOISY": float(compute_estoi(s_noisy, s_clean)),
-                    "SI_SDR_NOISY": float(scale_invariant_signal_distortion_ratio(s_noisy, s_clean)),
-                }
+            if "PESQ_NOISY" not in self._baseline_cache[sample_key]:
+                self._baseline_cache[sample_key].update({
+                    "PESQ_NOISY": float(compute_wb_pesq(s_noisy_ref.float(), s_clean_ref.float())),
+                    "STOI_NOISY": float(compute_estoi(s_noisy_ref.float(), s_clean_ref.float())),
+                    "SI_SDR_NOISY": float(scale_invariant_signal_distortion_ratio(s_noisy_ref, s_clean_ref)),
+                })
 
             # Métricas individuais (PESQ e STOI geralmente operam em amostras únicas)
-            pesq = float(compute_wb_pesq(s_enhanced, s_clean))
-            stoi = float(compute_estoi(s_enhanced, s_clean))
-
-            si_sdr_val = float(scale_invariant_signal_distortion_ratio(s_enhanced, s_clean))
+            pesq = float(compute_wb_pesq(s_enhanced.float(), s_clean_ref.float()))
+            stoi = float(compute_estoi(s_enhanced.float(), s_clean_ref.float()))
+            si_sdr_val = float(scale_invariant_signal_distortion_ratio(s_enhanced.flatten(), s_clean_ref.flatten()))
 
             mse = F.mse_loss(enhanced_stft[i : i + 1], clean_stft[i : i + 1]).item()
 
@@ -300,32 +355,40 @@ class CFMModule(pL.LightningModule):
                     "SI_SDR": si_sdr_val,
                     "MSE_AUDIO": mse,
                 },
-                'DNSMOS': {
-                    "MOS": dnsmos[i, 0, 0].item(),
-                    "SIG": dnsmos[i, 0, 1].item(),
-                    "BAK": dnsmos[i, 0, 2].item(),
-                    "OVL": dnsmos[i, 0, 3].item(),
-                    "CLEAN_MOS": dnsmos_clean[i, 0, 0].item(),
-                    "CLEAN_SIG": dnsmos_clean[i, 0, 1].item(),
-                    "CLEAN_BAK": dnsmos_clean[i, 0, 2].item(),
-                    "CLEAN_OVL": dnsmos_clean[i, 0, 3].item(),
-                    "NOISY_MOS": dnsmos_noisy[i, 0, 0].item(),
-                    "NOISY_SIG": dnsmos_noisy[i, 0, 1].item(),
-                    "NOISY_BAK": dnsmos_noisy[i, 0, 2].item(),
-                    "NOISY_OVL": dnsmos_noisy[i, 0, 3].item(),
-                }
             }
-            # Adiciona métricas baseadas no cache para a média do batch e buffer de áudio
-            res["sample"].update(self._baseline_cache[sample_key])
+
+            meta_row = {
+                "SNR_DB": self._metadata_at(metadata or {}, "snr_db", i),
+                "SNR_DB_ESTIMATED": self._metadata_at(metadata or {}, "snr_db_estimated", i),
+                "NOISE_TYPE": self._metadata_at(metadata or {}, "noise_type", i),
+                "SAMPLE_ID": self._metadata_at(metadata or {}, "sample_id", i),
+            }
+            res["meta"] = meta_row
+
+            trajectory_audio = None
+            if trajectory_wavs:
+                trajectory_audio = {
+                    f"step_{step_idx:04d}_t{t_key:.6f}": wav_batch[i].detach().cpu()
+                    for step_idx, (t_key, wav_batch) in enumerate(sorted(trajectory_wavs.items()))
+                }
+
+            # Adiciona métricas baseadas no cache para a média do batch e buffer de áudio.
+            # Filtramos para incluir apenas escalares, ignorando os áudios consistentes (tensores)
+            res["sample"].update({
+                k: v for k, v in self._baseline_cache[sample_key].items() if not k.startswith("s_")
+            })
             individual_metrics.append(res)
 
             # Salva no buffer de áudio (LoggingCallback) se ainda houver espaço
-            if len(buffer) < self.n_audios_to_log or log_suffix == "test":
+            buffer_limit = self.test_trajectory_n_audios if log_suffix == "test" else self.n_audios_to_log
+            if len(buffer) < buffer_limit:
                 buffer.append(
                     {
-                        "clean": s_clean.detach().cpu(),
-                        "noisy": s_noisy.detach().cpu(),
+                        "clean": s_clean_ref.detach().cpu(),
+                        "noisy": s_noisy_ref.detach().cpu(),
                         "enhanced": s_enhanced.detach().cpu(),
+                        "trajectory_audios": trajectory_audio,
+                        "meta": meta_row,
                         "metrics": res
                     }
                 )
@@ -334,13 +397,28 @@ class CFMModule(pL.LightningModule):
         if individual_metrics:
             for outer_key in individual_metrics[0].keys():
                 for inner_key in individual_metrics[0][outer_key].keys():
-                    avg = sum(m[outer_key][inner_key] for m in individual_metrics) / B
+                    values = [m[outer_key][inner_key] for m in individual_metrics]
+                    numeric_values = [v for v in values if isinstance(v, (int, float))]
+                    if len(numeric_values) != len(values):
+                        continue
+                    avg = sum(numeric_values) / B
                     self.log(f"{log_suffix}_{outer_key}/{inner_key}", avg, sync_dist=True, prog_bar=True, on_epoch=True)
 
-        return individual_metrics
+        return {
+            "metrics_list": individual_metrics,
+            "slow_target": clean_consistent_batch.detach(),
+            "slow_pred": enhanced_wav.detach(),
+            "slow_noisy": noisy_consistent_batch.detach(),
+        }
 
     @torch.no_grad()
-    def process_ola(self, noisy_wav: torch.Tensor, n_steps: int) -> torch.Tensor:
+    def process_ola(
+        self,
+        noisy_wav: torch.Tensor,
+        n_steps: int,
+        return_trajectory: bool = False,
+        snapshot_times: list[float] | None = None,
+    ) -> torch.Tensor | dict[str, torch.Tensor | dict[float, torch.Tensor]]:
         B, _C, T_orig = noisy_wav.shape
         win_len = int(self.audio_length_seconds * self.audio_sample_rate)
         hop_len = win_len // 2
@@ -366,34 +444,12 @@ class CFMModule(pL.LightningModule):
             hop_length=self.hop_length,
             window_size=self.window_size,
             alpha=self.alpha,
-            input_mel=self.input_mel,
-            mel_cfg=self.cfg.audio.mel.model_dump() if self.input_mel else None,
             sample_rate=self.audio_sample_rate,
         )
 
-        # 4. Modelo (ODE)
-        enhanced_stft_chunks = ode_solve(self.model, chunks_stft, n_steps=n_steps)
-
-        # 5. iSTFT + Desnormalização Local
-        # Como passamos o mean/std do chunk, o áudio já sai na escala correta para somar
-        enhanced_chunks = stft_to_waveform(
-            enhanced_stft_chunks,
-            length=win_len,
-            fft_size=self.fft_size,
-            hop_length=self.hop_length,
-            window_size=self.window_size,
-            alpha=self.alpha,
-            mean=mean,
-            std=std,
-        )
-        # 5. iSTFT ou Vocoder + Desnormalização Local
-        if self.input_mel:
-            enhanced_chunks = self.vocoder(enhanced_stft_chunks.squeeze(1)).waveforms
-            enhanced_chunks = enhanced_chunks * std.view(-1, 1) + mean.view(-1, 1)
-            enhanced_chunks = enhanced_chunks.unsqueeze(1)
-        else:
-            enhanced_chunks = stft_to_waveform(
-                enhanced_stft_chunks,
+        def chunks_stft_to_waveform(stft_chunks: torch.Tensor) -> torch.Tensor:
+            wav_chunks = stft_to_waveform(
+                stft_chunks,
                 length=win_len,
                 fft_size=self.fft_size,
                 hop_length=self.hop_length,
@@ -403,22 +459,45 @@ class CFMModule(pL.LightningModule):
                 std=std,
             )
 
-        # 6. Reconstrução Eficiente com Fold
-        # Aplicamos a janela de Hann para crossfade
-        window = torch.hann_window(win_len, device=self.device).view(1, 1, win_len)
-        enhanced_chunks = enhanced_chunks * window
+            if wav_chunks.shape[-1] != win_len:
+                wav_chunks = wav_chunks[..., :win_len]
 
-        # Preparamos para o F.fold: (B, C*win_len, n_chunks)
-        combined = rearrange(enhanced_chunks, "(B N) C L -> B (C L) N", B=B)
+            if wav_chunks.ndim == 2:
+                wav_chunks = wav_chunks.unsqueeze(1)
 
-        # Soma os chunks sobrepostos
-        output = F.fold(combined, output_size=(1, T_pad), kernel_size=(1, win_len), stride=(1, hop_len))
+            window = torch.hann_window(win_len, device=self.device).view(1, 1, win_len)
+            wav_chunks = wav_chunks * window
+            combined = rearrange(wav_chunks, "(B N) C L -> B (C L) N", B=B)
 
-        # Soma os pesos das janelas para normalizar a amplitude no overlap
-        window_ones = window.expand(B, n_chunks, -1).transpose(1, 2)  # (B, win_len, n_chunks)
-        weights = F.fold(window_ones, output_size=(1, T_pad), kernel_size=(1, win_len), stride=(1, hop_len))
+            output = F.fold(combined, output_size=(1, T_pad), kernel_size=(1, win_len), stride=(1, hop_len))
+            window_ones = window.expand(B, n_chunks, -1).transpose(1, 2)
+            weights = F.fold(window_ones, output_size=(1, T_pad), kernel_size=(1, win_len), stride=(1, hop_len))
 
-        return (output / (weights + 1e-8)).squeeze(2)[..., :T_orig]
+            return (output / (weights + 1e-8)).squeeze(2)[..., :T_orig]
+
+        # 4. Modelo (ODE)
+        solve_out = ode_solve(
+            self.model,
+            chunks_stft,
+            n_steps=n_steps,
+            return_trajectory=return_trajectory,
+            snapshot_times=snapshot_times,
+        )
+
+        if return_trajectory:
+            final_stft = solve_out["final"]
+            enhanced_wav = chunks_stft_to_waveform(final_stft)
+            snapshot_stfts = solve_out.get("snapshots", {})
+            snapshot_wavs = {
+                t_key: chunks_stft_to_waveform(stft_state)
+                for t_key, stft_state in snapshot_stfts.items()
+            }
+            return {
+                "final": enhanced_wav,
+                "snapshots": snapshot_wavs,
+            }
+
+        return chunks_stft_to_waveform(solve_out)
 
     def __interpolate_and_generate_cfm_loss(self, noisy_stft: torch.Tensor, clean_stft: torch.Tensor):
         # Get data shapes
@@ -441,8 +520,12 @@ class CFMModule(pL.LightningModule):
         return cfm_loss(v_pred=v_pred, x_0=noisy_stft, x_1=clean_stft, weight=weight), v_pred
 
     def configure_optimizers(self):
-        # AdamW é o padrão-ouro para Continuous Flow Matching e U-Nets
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        # Usa AdamW 8-bit (bitsandbytes) para reduzir uso de memória do otimizador.
+        optimizer = bnb.optim.AdamW8bit(
+            self.model.parameters(),
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+        )
 
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer=optimizer,

@@ -70,24 +70,3 @@ class MRSTFTLoss(torch.nn.Module):
             mag_loss_total += mag_loss
 
         return (sc_loss_total + mag_loss_total) / len(self.stft_losses)
-
-
-class MelSpectralLoss(torch.nn.Module):
-    def __init__(self, eps: float = 1e-8):
-        super().__init__()
-        self.eps = eps
-
-    def forward(self, est_mel: torch.Tensor, target_mel: torch.Tensor) -> torch.Tensor:
-        # est_mel, target_mel: (B, 1, Mels, T)
-        # 1. Perda de Magnitude Logarítmica (L1 direta pois já estamos em log-mel)
-        l_mag = F.l1_loss(est_mel, target_mel)
-
-        # 2. Convergência Espectral (exige escala linear)
-        est_mel_lin = torch.exp(est_mel)
-        target_mel_lin = torch.exp(target_mel)
-
-        sc_num = torch.linalg.norm(target_mel_lin - est_mel_lin, ord="fro", dim=(-2, -1))
-        sc_den = torch.linalg.norm(target_mel_lin, ord="fro", dim=(-2, -1))
-        l_sc = (sc_num / (sc_den + self.eps)).mean()
-
-        return l_mag + l_sc

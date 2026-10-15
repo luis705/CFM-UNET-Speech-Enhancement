@@ -9,9 +9,10 @@ from src.utils.settings import Settings
 
 
 class VBDMDDataModule(pl.LightningDataModule):
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, test_samples_limit: int = -1) -> None:
         super().__init__()
         self.settings = settings
+        self.test_samples_limit = test_samples_limit
         self._train_ds = None
         self._val_ds = None
         self._test_ds = None
@@ -48,6 +49,7 @@ class VBDMDDataModule(pl.LightningDataModule):
                 cache_dir=cfg.dataset.cache_dir,
                 pad_or_crop=False,
                 augment=False,
+                include_metadata=True,
             )
             # Aplicamos os índices do subset de validação ao dataset sem crop
             self._val_ds = torch.utils.data.Subset(full_val_var_len, val_subset.indices)
@@ -60,7 +62,11 @@ class VBDMDDataModule(pl.LightningDataModule):
                 cache_dir=cfg.dataset.cache_dir,
                 pad_or_crop=False,
                 augment=False,
+                include_metadata=True,
             )
+            if self.test_samples_limit > 0 and len(self._test_ds) > self.test_samples_limit:
+                # Limita o dataset de teste ao número especificado de amostras
+                self._test_ds = torch.utils.data.Subset(self._test_ds, range(self.test_samples_limit))
 
     def train_dataloader(self) -> DataLoader:
         return DataLoader(

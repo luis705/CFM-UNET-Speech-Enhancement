@@ -23,6 +23,7 @@ from src.utils.callbacks import (
     EMACallback,
     LoggingCallback,
     MinEpochEarlyStopping,
+    SlowMetricsCallback,
     SystemStatsLoggerCallback,
 )
 from src.utils.settings import get_settings
@@ -33,7 +34,7 @@ def main() -> None:
     parser.add_argument("--config", type=str, default="settings.yaml", help="Path to settings YAML")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--mel", action="store_true", help="Use mel-spectrograms")
+    parser.add_argument("--dataset_limit", type=int, default=-1, help="Limit the number of samples in the dataset")
     args = parser.parse_args()
 
     if args.checkpoint is None:
@@ -45,13 +46,13 @@ def main() -> None:
     settings = get_settings(args.config)
 
     # Data
-    datamodule = VBDMDDataModule(settings)
+    datamodule = VBDMDDataModule(settings, test_samples_limit=args.dataset_limit)
 
     # Model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     with torch.device(device):
-        model = CFMModule.load_from_checkpoint(args.checkpoint, cfg=settings, input_mel=args.mel)
+        model = CFMModule.load_from_checkpoint(args.checkpoint, cfg=settings)
 
 
     # Callbacks
@@ -77,6 +78,7 @@ def main() -> None:
             config_path=args.config,
             histogram_logging_frequency=settings.logging.histogram_logging_frequency,
         ),
+        SlowMetricsCallback(settings),
         RichModelSummary(max_depth=2),
         EMACallback(0.99),
         SystemStatsLoggerCallback(),

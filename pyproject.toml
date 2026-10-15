@@ -2,7 +2,7 @@
 name = "src"
 version = "0.1.0"
 description = "Conditional Flow Matching for Speech Enhancement"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "torch>=2.4",
     "torchaudio>=2.4",
@@ -11,6 +11,7 @@ dependencies = [
     "pydantic-settings>=2.0",
     "pyyaml>=6.0",
     "tensorboard>=2.14",
+    "mlflow>=2.17",
     "torchmetrics[audio]>=1.2",
     "torchdiffeq>=0.2",
     "datasets>=3.0",
@@ -32,6 +33,9 @@ dependencies = [
     "einops>=0.8.2",
     "torchinfo>=1.8.0",
     "torchvision>=0.26.0",
+    "seaborn>=0.13.2",
+    "transformers>=4.55.0",
+    "bitsandbytes>=0.47.0",
 ]
 
 [dependency-groups]

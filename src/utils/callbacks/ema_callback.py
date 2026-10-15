@@ -5,7 +5,7 @@ import torch
 
 
 class EMACallback(pl.Callback):
-    """Maintain EMA shadow parameters and swap them in during validation."""
+    """Maintain EMA shadow parameters and swap them in during validation and test."""
 
     def __init__(self, ema_decay: float = 0.999) -> None:
         super().__init__()
@@ -36,7 +36,7 @@ class EMACallback(pl.Callback):
                 # Shadow = Shadow * d + Param * (1 - d)
                 self._ema_params[name].mul_(d).add_(param.data, alpha=1.0 - d)
 
-    # ── Swap to EMA for validation ───────────────────────────────────────
+    # ── Swap to EMA for validation and test ──────────────────────────────
 
     def on_validation_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         self._originals.clear()
@@ -50,3 +50,16 @@ class EMACallback(pl.Callback):
             if name in self._originals:
                 param.data.copy_(self._originals[name])
         self._originals.clear()
+
+    def on_test_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        self.on_validation_epoch_start(trainer, pl_module)
+
+    def on_test_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        self.on_validation_epoch_end(trainer, pl_module)
+
+    def on_save_checkpoint(self, trainer: pl.Trainer, pl_module: pl.LightningModule, checkpoint: dict) -> None:
+        checkpoint["ema_params"] = self._ema_params
+
+    def on_load_checkpoint(self, trainer: pl.Trainer, pl_module: pl.LightningModule, checkpoint: dict) -> None:
+        if "ema_params" in checkpoint:
+            self._ema_params = checkpoint["ema_params"]

@@ -1,7 +1,6 @@
 import torch
 import torchaudio
 
-
 def complex_to_channels(spec: torch.Tensor) -> torch.Tensor:
     """Converts complex STFT to 2-channel real.
 
@@ -124,42 +123,6 @@ def signal_to_stft(
     return spec
 
 
-def signal_to_mel(
-    signal: torch.Tensor,
-    sample_rate: int,
-    n_fft: int,
-    hop_length: int,
-    win_length: int,
-    n_mels: int,
-    f_min: float,
-    f_max: float | None,
-) -> torch.Tensor:
-    if signal.ndim == 3:
-        signal = signal.squeeze(1)
-
-    mel_transform = torchaudio.transforms.MelSpectrogram(
-        sample_rate=sample_rate,
-        n_fft=n_fft,
-        win_length=win_length,
-        hop_length=hop_length,
-        n_mels=n_mels,
-        f_min=f_min,
-        f_max=f_max,
-        power=2.0,
-        normalized=False,
-        center=True,
-        pad_mode="reflect",
-        onesided=True,
-    ).to(signal.device)
-
-    mel = mel_transform(signal)
-    # Log compression para compatibilidade com vocoders
-    log_mel = torch.log(torch.clamp(mel, min=1e-5))
-
-    # Retorna (B, 1, n_mels, T)
-    return log_mel.unsqueeze(1)
-
-
 def preprocess_item(
     noisy_audio: torch.Tensor,
     clean_audio: torch.Tensor,
@@ -169,8 +132,6 @@ def preprocess_item(
     hop_length: int = 128,
     window_size: int = 256,
     alpha: float = 0.5,
-    input_mel: bool = False,
-    mel_cfg: dict | None = None,
     sample_rate: int = 16000,
 ) -> torch.Tensor:
     # Pad / crop to fixed length
@@ -179,21 +140,6 @@ def preprocess_item(
 
     # Z-score normalize (based on noisy to preserve SNR)
     noisy, clean, mean, std = z_score_normalize(noisy_audio, clean_audio)
-
-    if input_mel and mel_cfg is not None:
-        # Remove campos de metadados se existirem
-        mel_params = {k: v for k, v in mel_cfg.items() if k != "vocoder_model_path"}
-        noisy_stft = signal_to_mel(
-            noisy, sample_rate, 
-            n_fft=fft_size, hop_length=hop_length, win_length=window_size, 
-            **mel_params
-        )
-        clean_stft = signal_to_mel(
-            clean, sample_rate, 
-            n_fft=fft_size, hop_length=hop_length, win_length=window_size, 
-            **mel_params
-        )
-        return noisy_audio, clean_audio, noisy_stft, clean_stft, mean, std
 
     noisy_stft = signal_to_stft(noisy, fft_size, hop_length, window_size, alpha)
     clean_stft = signal_to_stft(clean, fft_size, hop_length, window_size, alpha)

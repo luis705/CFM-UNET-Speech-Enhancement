@@ -6,3 +6,6 @@
 tb_logs
 test_results
 *.csv
+old
+logs
+records

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 from pathlib import Path
 import sys
 import matplotlib
 import torch
+import os
 
 # Ensure project root is on sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -52,10 +54,12 @@ def main() -> None:
         model = CFMModule(settings)
 
     # Logger
+    timestamp = datetime.now()
     mlflow_logger = MLFlowLogger(
-        experiment_name="cfm-unet",
+        experiment_name="cfm-unet-se",
         tracking_uri="http://192.168.0.100:10002",
-        run_name="cfm-unet-run",
+        run_name=f"cfm-unet-run-{timestamp.isoformat()}",
+        run_id="a17044622e1141cfad41eb22a55055a2"
     )
 
     # Callbacks

@@ -36,17 +36,27 @@ class SlowMetricsCallback(pl.Callback):
 
         self._val_values: dict[str, list[float]] = {
             "stoi": [],
+            "stoi_noisy": [],
             "pesq_wb": [],
+            "pesq_wb_noisy": [],
             "pesq_nb": [],
+            "pesq_nb_noisy": [],
             "spk_sim": [],
+            "spk_sim_noisy": [],
             "utmos": [],
+            "utmos_noisy": [],
         }
         self._test_values: dict[str, list[float]] = {
             "stoi": [],
+            "stoi_noisy": [],
             "pesq_wb": [],
+            "pesq_wb_noisy": [],
             "pesq_nb": [],
+            "pesq_nb_noisy": [],
             "spk_sim": [],
+            "spk_sim_noisy": [],
             "utmos": [],
+            "utmos_noisy": [],
         }
 
         self._val_spk_gt_cache: dict[int, torch.Tensor] = {}
@@ -154,15 +164,20 @@ class SlowMetricsCallback(pl.Callback):
             if hasattr(self._utmos_predictor, "to"):
                 self._utmos_predictor.to(self._utmos_device)
 
+    def _logger_base_dir(self, trainer: pl.Trainer, fallback_dir: str) -> str:
+        logger = getattr(trainer, "logger", None)
+        log_dir = getattr(logger, "log_dir", None)
+        if log_dir:
+            return log_dir
+        return fallback_dir
+
     def _slow_metric_cache_dir(self, trainer: pl.Trainer) -> str:
-        if trainer.logger is not None and hasattr(trainer.logger, "log_dir"):
-            return os.path.join(trainer.logger.log_dir, "metrics_cache")
-        return os.path.join(self.cfg.test.save_dir, "metrics_cache")
+        base_dir = self._logger_base_dir(trainer, self.cfg.logging.log_dir)
+        return os.path.join(base_dir, "metrics_cache")
 
     def _metrics_output_dir(self, trainer: pl.Trainer) -> str:
-        if trainer.logger is not None and hasattr(trainer.logger, "log_dir"):
-            return os.path.join(trainer.logger.log_dir, "metrics")
-        return self.cfg.test.save_dir
+        base_dir = self._logger_base_dir(trainer, self.cfg.logging.log_dir)
+        return os.path.join(base_dir, "metrics")
 
     def _val_spk_gt_cache_path(self, trainer: pl.Trainer) -> str:
         return os.path.join(self._slow_metric_cache_dir(trainer), "val_spk_gt_embeddings.pt")
@@ -269,16 +284,6 @@ class SlowMetricsCallback(pl.Callback):
         values_by_metric = self._val_values if split == "val" else self._test_values
         selected_indices = self._get_selected_indices(split, target.shape[0])
 
-        pl_module.log(
-            f"{split}_slow_metrics/selected_count",
-            torch.tensor(float(len(selected_indices)), device=pl_module.device),
-            on_step=False,
-            on_epoch=True,
-            sync_dist=sync,
-            reduce_fx="sum",
-            batch_size=1,
-        )
-
         if not selected_indices:
             return
 
@@ -308,15 +313,10 @@ class SlowMetricsCallback(pl.Callback):
         sample_slow_rows: list[dict[str, float | None]] = [
             {
                 "STOI": None,
-                "STOI_CLEAN": None,
                 "PESQ_WB": None,
-                "PESQ_WB_CLEAN": None,
                 "PESQ_NB": None,
-                "PESQ_NB_CLEAN": None,
                 "SPK_SIM": None,
-                "SPK_SIM_CLEAN": None,
                 "UTMOS": None,
-                "UTMOS_CLEAN": None,
                 "STOI_NOISY": None,
                 "PESQ_WB_NOISY": None,
                 "PESQ_NB_NOISY": None,
@@ -413,20 +413,17 @@ class SlowMetricsCallback(pl.Callback):
                 return None
             return None
 
-        signal_order = ["enhanced", "clean", "noisy"]
+        signal_order = ["enhanced", "noisy"]
         suffix_by_signal = {
             "enhanced": "",
-            "clean": "_CLEAN",
             "noisy": "_NOISY",
         }
         wb_signals = {
             "enhanced": deg_batch,
-            "clean": ref_batch,
             "noisy": noisy_batch,
         }
         nb_signals = {
             "enhanced": deg_nb_batch,
-            "clean": ref_nb_batch,
             "noisy": noisy_nb_batch,
         }
 
@@ -449,7 +446,7 @@ class SlowMetricsCallback(pl.Callback):
 
         for _metric_name, row_prefix, agg_key, source_key, safe_fn in metric_specs:
             signal_map = wb_signals if source_key == "wb" else nb_signals
-            ref_sig = signal_map.get("clean")
+            ref_sig = deg_batch if source_key == "wb" else deg_nb_batch
             if ref_sig is None:
                 continue
 
@@ -471,13 +468,10 @@ class SlowMetricsCallback(pl.Callback):
                 _assign_values(f"{row_prefix}{suffix_by_signal[signal_type]}", values)
                 if signal_type == "enhanced":
                     primary_metric_values[agg_key] = values
-                    values_by_metric[agg_key].extend(values)
-
-        stoi_values = primary_metric_values["stoi"]
-        pesq_wb_values = primary_metric_values["pesq_wb"]
-        pesq_nb_values = primary_metric_values["pesq_nb"]
-        spk_sim_values = primary_metric_values["spk_sim"]
-        utmos_values = primary_metric_values["utmos"]
+                metric_key = agg_key if signal_type == "enhanced" else f"{agg_key}_{signal_type}"
+                if metric_key not in values_by_metric:
+                    values_by_metric[metric_key] = []
+                values_by_metric[metric_key].extend(values)
 
         if split == "test" and outputs is not None:
             metrics_list = outputs.get("metrics_list")
@@ -486,23 +480,6 @@ class SlowMetricsCallback(pl.Callback):
                     if 0 <= local_idx < len(metrics_list) and isinstance(metrics_list[local_idx], dict):
                         slow_group = metrics_list[local_idx].setdefault("slow", {})
                         slow_group.update(sample_slow_rows[pos])
-
-        for metric_name, values in {
-            "stoi_count": stoi_values,
-            "pesq_wb_count": pesq_wb_values,
-            "pesq_nb_count": pesq_nb_values,
-            "spk_sim_count": spk_sim_values,
-            "utmos_count": utmos_values,
-        }.items():
-            pl_module.log(
-                f"{split}_slow_metrics/{metric_name}",
-                torch.tensor(float(len(values)), device=pl_module.device),
-                on_step=False,
-                on_epoch=True,
-                sync_dist=sync,
-                reduce_fx="sum",
-                batch_size=1,
-            )
 
     def _log_epoch_summary(self, pl_module: pl.LightningModule, split: str) -> None:
         values_by_metric = self._val_values if split == "val" else self._test_values
@@ -514,14 +491,5 @@ class SlowMetricsCallback(pl.Callback):
 
             t = torch.tensor(values, device=pl_module.device, dtype=torch.float32)
             mean = t.mean()
-            std = t.std(unbiased=False)
 
             pl_module.log(f"{split}_slow_metrics/{metric_name}", mean, on_step=False, on_epoch=True, sync_dist=sync)
-            pl_module.log(f"{split}_slow_metrics/{metric_name}_std", std, on_step=False, on_epoch=True, sync_dist=sync)
-            pl_module.log(
-                f"{split}_slow_metrics/{metric_name}_count_epoch",
-                torch.tensor(float(len(values)), device=pl_module.device),
-                on_step=False,
-                on_epoch=True,
-                sync_dist=sync,
-            )

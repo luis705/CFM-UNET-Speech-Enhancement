@@ -42,7 +42,7 @@ ode:
   test_steps: 5
 
 logging:
-  log_dir: tb_logs
+  log_dir: logs
   n_audios: 5
   histogram_logging_frequency: 100
 

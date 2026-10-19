@@ -418,6 +418,7 @@ class CFMModule(pL.LightningModule):
         n_steps: int,
         return_trajectory: bool = False,
         snapshot_times: list[float] | None = None,
+        chunk_batch_size: int = 1,
     ) -> torch.Tensor | dict[str, torch.Tensor | dict[float, torch.Tensor]]:
         B, _C, T_orig = noisy_wav.shape
         win_len = int(self.audio_length_seconds * self.audio_sample_rate)
@@ -433,8 +434,7 @@ class CFMModule(pL.LightningModule):
         n_chunks = chunks.shape[-2]
         chunks = rearrange(chunks, "B C N L -> (B N) C L")
 
-        # 3. Uso do seu preprocess_item (Normaliza e gera STFT por chunk)
-        # Passamos noisy duas vezes pois na validação/inferência não temos o clean original do chunk
+        # 3. Uso do seu preprocess_item
         _, _, chunks_stft, _, mean, std = preprocess_item(
             chunks,
             chunks,
@@ -475,29 +475,52 @@ class CFMModule(pL.LightningModule):
 
             return (output / (weights + 1e-8)).squeeze(2)[..., :T_orig]
 
-        # 4. Modelo (ODE)
-        solve_out = ode_solve(
-            self.model,
-            chunks_stft,
-            n_steps=n_steps,
-            return_trajectory=return_trajectory,
-            snapshot_times=snapshot_times,
-        )
+        # 4. Modelo (ODE) - Fatiado em mini-batches para poupar VRAM
+        n_total_chunks = chunks_stft.shape[0]
+        final_stfts = []
+        snapshot_stfts_dict = {} if return_trajectory else None
 
+        for i in range(0, n_total_chunks, chunk_batch_size):
+            # Pega o lote
+            batch_stft = chunks_stft[i : i + chunk_batch_size]
+            
+            solve_out = ode_solve(
+                self.model,
+                batch_stft,
+                n_steps=n_steps,
+                return_trajectory=return_trajectory,
+                snapshot_times=snapshot_times,
+            )
+
+            # Move o resultado imediatamente para a CPU para liberar VRAM
+            if return_trajectory:
+                final_stfts.append(solve_out["final"].cpu())
+                for t_key, stft_state in solve_out.get("snapshots", {}).items():
+                    if t_key not in snapshot_stfts_dict:
+                        snapshot_stfts_dict[t_key] = []
+                    snapshot_stfts_dict[t_key].append(stft_state.cpu())
+            else:
+                final_stfts.append(solve_out.cpu())
+
+        # 5. Reconstrução
         if return_trajectory:
-            final_stft = solve_out["final"]
-            enhanced_wav = chunks_stft_to_waveform(final_stft)
-            snapshot_stfts = solve_out.get("snapshots", {})
-            snapshot_wavs = {
-                t_key: chunks_stft_to_waveform(stft_state)
-                for t_key, stft_state in snapshot_stfts.items()
-            }
+            # Sobe o tensor principal de volta para a GPU antes de reconstruir
+            final_stft_tensor = torch.cat(final_stfts, dim=0).to(self.device)
+            enhanced_wav = chunks_stft_to_waveform(final_stft_tensor)
+            
+            snapshot_wavs = {}
+            for t_key, stft_list in snapshot_stfts_dict.items():
+                # Sobe os tensores da trajetória de volta para a GPU também
+                combined_snapshot = torch.cat(stft_list, dim=0).to(self.device)
+                snapshot_wavs[t_key] = chunks_stft_to_waveform(combined_snapshot)
+                
             return {
                 "final": enhanced_wav,
                 "snapshots": snapshot_wavs,
             }
 
-        return chunks_stft_to_waveform(solve_out)
+        final_stft_tensor = torch.cat(final_stfts, dim=0).to(self.device)
+        return chunks_stft_to_waveform(final_stft_tensor)
 
     def __interpolate_and_generate_cfm_loss(self, noisy_stft: torch.Tensor, clean_stft: torch.Tensor):
         # Get data shapes

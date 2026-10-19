@@ -95,7 +95,18 @@ def main() -> None:
 
     results = trainer.test(model, datamodule=datamodule)
 
-    print(results)
+    weights_dir = Path(settings.logging.log_dir) / "weights"
+    weights_dir.mkdir(parents=True, exist_ok=True)
+    weights_path = weights_dir / "cfm_unet_weights.pt"
+
+    payload = {
+        "model_state_dict": model.model.state_dict(),
+        "cfg": settings.model_dump(),
+        "arch": "CFMUnet",
+    }
+    torch.save(payload, weights_path)
+    print(f"Saved model weights to: {weights_path}")
+    # print(results)
 
 
 if __name__ == "__main__":

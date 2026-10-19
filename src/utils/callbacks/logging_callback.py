@@ -6,6 +6,7 @@ import os
 import shutil
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 from PIL import Image
 import pytorch_lightning as pl
@@ -77,28 +78,124 @@ class LoggingCallback(pl.Callback):
 
         return mag_img, phase_img
 
-    def on_train_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
-        tb = pl_module.logger.experiment if pl_module.logger else None
+    def _logger_base_dir(self, trainer: pl.Trainer, fallback_dir: str = "tb_logs") -> str:
+        logger = getattr(trainer, "logger", None)
+        log_dir = getattr(logger, "log_dir", None)
+        if log_dir:
+            return log_dir
+        return fallback_dir
 
-        if tb is None:
+    def _tensorboard_backend(self, pl_module: pl.LightningModule):
+        logger = getattr(pl_module, "logger", None)
+        experiment = getattr(logger, "experiment", None)
+        if experiment is not None and hasattr(experiment, "add_scalar"):
+            return experiment
+        return None
+
+    def _mlflow_logger(self, pl_module: pl.LightningModule):
+        logger = getattr(pl_module, "logger", None)
+        if logger is None:
+            return None
+        if hasattr(logger, "log_metrics") and self._tensorboard_backend(pl_module) is None:
+            return logger
+        return None
+
+    def _log_mlflow_artifact(self, pl_module: pl.LightningModule, file_path: str, artifact_path: str) -> None:
+        logger = self._mlflow_logger(pl_module)
+        if logger is None or not os.path.exists(file_path):
             return
+        import mlflow
 
-        log_dir = trainer.logger.log_dir  # dir do run atual
-        if os.path.exists(self.config_path):
+        run_id = getattr(logger, "run_id", None)
+        if run_id is None:
+            return
+        try:
+            active_run = mlflow.active_run()
+            if active_run is None:
+                active_run = mlflow.start_run(run_id=run_id)
+
+            if active_run and active_run.info.status == "FAILED":
+                client = mlflow.tracking.MlflowClient()
+                client.update_run(active_run.info.run_id, status="RUNNING")
+
+            mlflow.log_artifact(file_path, artifact_path=artifact_path)
+        except Exception:
+            pass
+
+    def _log_mlflow_image(self, pl_module: pl.LightningModule, image, name: str, step: int | None = None) -> None:
+        logger = self._mlflow_logger(pl_module)
+        if logger is None:
+            return
+        try:
+            import mlflow
+            run_id = getattr(logger, "run_id", None)
+            if run_id is None:
+                return
+
+            active_run = mlflow.active_run()
+            if active_run is None:
+                active_run = mlflow.start_run(run_id=run_id)
+
+            if active_run and active_run.info.status == "FAILED":
+                client = mlflow.tracking.MlflowClient()
+                client.update_run(active_run.info.run_id, status="RUNNING")
+
+            if torch.is_tensor(image):
+                arr = image.detach().cpu().numpy()
+                if arr.ndim == 2:
+                    arr = arr.astype(np.float32)
+                elif arr.ndim == 3 and arr.shape[0] in (1, 3, 4):
+                    arr = arr.transpose(1, 2, 0)
+
+                if arr.ndim == 3 and arr.shape[-1] == 1:
+                    arr = arr[..., 0]
+                if arr.ndim == 3 and arr.shape[-1] in (3, 4):
+                    arr = np.clip(arr, 0.0, 1.0)
+                    arr = (arr * 255).astype(np.uint8)
+                elif arr.ndim == 2:
+                    arr = np.clip(arr, 0.0, 1.0)
+                    arr = (arr * 255).astype(np.uint8)
+                
+                # 💡 MUDANÇA AQUI: usar `key` em vez de `artifact_file`
+                mlflow.log_image(arr, key=name, step=step)
+            else:
+                mlflow.log_image(image, key=name, step=step)
+        except Exception:
+            pass
+
+    def _log_metric_value(self, pl_module: pl.LightningModule, name: str, value, step: int | None = None) -> None:
+        tb = self._tensorboard_backend(pl_module)
+        mlflow_logger = self._mlflow_logger(pl_module)
+        if mlflow_logger is not None:
+            try:
+                mlflow_logger.log_metrics({name: float(value)}, step=step)
+            except Exception:
+                pass
+            return
+        if tb is not None:
+            tb.add_scalar(name, float(value), step)
+
+    def on_train_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        tb = self._tensorboard_backend(pl_module)
+        log_dir = self._logger_base_dir(trainer, fallback_dir=getattr(getattr(pl_module, "cfg", None), "logging", None).log_dir if getattr(pl_module, "cfg", None) is not None and hasattr(getattr(pl_module, "cfg", None), "logging") else "tb_logs")
+        os.makedirs(log_dir, exist_ok=True)
+
+        if tb is not None and os.path.exists(self.config_path):
             shutil.copy(self.config_path, os.path.join(log_dir, "config.yaml"))
-            # Opcional: logar conteúdo como texto também
             with open(self.config_path) as f:
                 config_content = f.read()
             tb.add_text("config", config_content, global_step=0)
-
-        tb.add_text("model_summary", str(pl_module), global_step=0)
+            tb.add_text("model_summary", str(pl_module), global_step=0)
+        elif os.path.exists(self.config_path):
+            dst = os.path.join(log_dir, "config.yaml")
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy(self.config_path, dst)
+            self._log_mlflow_artifact(pl_module, dst, artifact_path="config")
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         if self.histogram_logging_frequency > 0 and batch_idx % self.histogram_logging_frequency == 0:
-            tb = pl_module.logger.experiment if pl_module.logger else None
-
-            if tb is None:
-                return
+            tb = self._tensorboard_backend(pl_module)
+            mlflow_logger = self._mlflow_logger(pl_module)
 
             model = pl_module.model
             hists = {
@@ -111,22 +208,34 @@ class LoggingCallback(pl.Callback):
             }
 
             step = pl_module.global_step
+            metrics_to_log = {}
 
             for name, param in hists.items():
                 # 1. Log dos Pesos (Histograma e Norma L2)
-                tb.add_histogram(f"weights/{name}", param.detach().cpu(), global_step=step)
+                if tb is not None:
+                    tb.add_histogram(f"weights/{name}", param.detach().cpu(), global_step=step)
 
                 weight_norm = torch.linalg.vector_norm(param).item()
-                tb.add_scalar(f"norms_weight/{name}", weight_norm, global_step=step)
+                metrics_to_log[f"norms_weight/{name}"] = float(weight_norm)
 
                 # 2. Log dos Gradientes (Histograma e Norma L2)
                 if param.grad is not None:
-                    tb.add_histogram(f"grads/{name}", param.grad.detach().cpu(), global_step=step)
+                    if tb is not None:
+                        tb.add_histogram(f"grads/{name}", param.grad.detach().cpu(), global_step=step)
 
                     grad_norm = torch.linalg.vector_norm(param.grad).item()
-                    tb.add_scalar(f"norms_grad/{name}", grad_norm, global_step=step)
+                    metrics_to_log[f"norms_grad/{name}"] = float(grad_norm)
 
-            tb.flush()
+            if mlflow_logger is not None:
+                try:
+                    mlflow_logger.log_metrics(metrics_to_log, step=step)
+                except Exception:
+                    pass
+
+            if tb is not None:
+                for metric_name, value in metrics_to_log.items():
+                    tb.add_scalar(metric_name, value, global_step=step)
+                tb.flush()
 
     def on_validation_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         """Garante que o buffer de áudio comece vazio em cada validação."""
@@ -141,7 +250,14 @@ class LoggingCallback(pl.Callback):
             buf.clear()
 
     def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        self.save_from_buffer(pl_module, "val_audio_buffer", "val_binaries")
+        print("VAL BUFFER LEN", len(getattr(pl_module, "val_audio_buffer", [])))
+        print("TEST BUFFER LEN", len(getattr(pl_module, "test_audio_buffer", [])))
+        local_path = getattr(getattr(pl_module, "cfg", None), "test", None)
+        local_path = getattr(local_path, "save_dir", None) if local_path is not None else None
+        if local_path is None:
+            local_path = "test_results/samples"
+        os.makedirs(local_path, exist_ok=True)
+        self.save_from_buffer(pl_module, "val_audio_buffer", "val_binaries", local_path=local_path)
 
     def on_test_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         """Processa o fim do teste. Salva localmente APENAS se não houver logger ativo."""
@@ -158,8 +274,11 @@ class LoggingCallback(pl.Callback):
             os.makedirs(local_path, exist_ok=True)
             print(f"\n[Logging] Salvando resultados de teste localmente em: {local_path}")
 
+        if local_path is None and (not hasattr(trainer.logger, "experiment") or not hasattr(trainer.logger.experiment, "add_audio")):
+            local_path = getattr(pl_module.cfg.test, "save_dir", "test_results/samples")
+            os.makedirs(local_path, exist_ok=True)
+
         # 1. Salva amostras de áudio
-        # Se local_path for None (caso do train.py), save_from_buffer usará apenas o TB
         self.save_from_buffer(
             pl_module,
             "test_audio_buffer",
@@ -180,11 +299,18 @@ class LoggingCallback(pl.Callback):
         local_path: str | None = None,
         sample_limit: int | None = None,
     ) -> None:
+        if local_path is None:
+            cfg_test = getattr(getattr(pl_module, "cfg", None), "test", None)
+            local_path = getattr(cfg_test, "save_dir", None) if cfg_test is not None else None
+        if local_path is None:
+            local_path = "test_results/samples"
+        os.makedirs(local_path, exist_ok=True)
+
         buf = getattr(pl_module, buf_name, [])
         if not buf:
             return
 
-        tb = pl_module.logger.experiment if pl_module.logger and hasattr(pl_module.logger, "experiment") else None
+        tb = self._tensorboard_backend(pl_module)
 
         sr = pl_module.audio_sample_rate
         step = pl_module.global_step
@@ -221,12 +347,20 @@ class LoggingCallback(pl.Callback):
                 for group_metrics in metrics.values():
                     for m_name, m_val in group_metrics.items():
                         try:
-                            # Tenta converter para float (TensorBoard só aceita números)
                             val_to_log = float(m_val)
                             tb.add_scalar(f"{tb_preffix}_{suffix}/{m_name}", val_to_log, step)
                         except (ValueError, TypeError):
-                            # Se for texto (como "unknown" ou um "sample_id"), apenas ignora o plot escalar
                             pass
+            else:
+                mlflow_logger = self._mlflow_logger(pl_module)
+                if mlflow_logger is not None:
+                    for group_metrics in metrics.values():
+                        for m_name, m_val in group_metrics.items():
+                            try:
+                                value = float(m_val)
+                                mlflow_logger.log_metrics({f"{tb_preffix}_{suffix}/{m_name}": value}, step=step)
+                            except (ValueError, TypeError):
+                                pass
 
             self._log_rich_audio_data(
                 pl_module.cfg.audio,
@@ -239,6 +373,7 @@ class LoggingCallback(pl.Callback):
                 suffix=suffix,
                 tb_preffix=tb_preffix,
                 local_path=local_path,
+                pl_module=pl_module,
             )
 
         buf.clear()
@@ -263,6 +398,7 @@ class LoggingCallback(pl.Callback):
         suffix: str,
         tb_preffix: str,
         local_path: str = None,
+        pl_module: pl.LightningModule | None = None,
     ) -> None:
         # torchaudio.save espera tensores 1D ou 2D. Se vier (1, 1, T), removemos o batch.
         if enhanced.ndim == 3: enhanced = enhanced.squeeze(0)
@@ -292,6 +428,8 @@ class LoggingCallback(pl.Callback):
             
             return torch.mean(snr).item()
         
+        mlflow_logger = self._mlflow_logger(pl_module) if pl_module is not None else None
+
         if local_path:
             sample_dir = os.path.join(local_path, suffix)
             os.makedirs(sample_dir, exist_ok=True)
@@ -306,9 +444,22 @@ class LoggingCallback(pl.Callback):
                     safe_name = t_name.replace(".", "p")
                     torchaudio.save(os.path.join(sample_dir, f"enhanced_{safe_name}.wav"), wav, sr)
 
+            if mlflow_logger is not None:
+                for artifact_name in ["clean.wav", "noisy.wav", "enhanced.wav"]:
+                    self._log_mlflow_artifact(pl_module, os.path.join(sample_dir, artifact_name), artifact_path=f"{tb_preffix}_{suffix}")
+                if trajectory_audios:
+                    for t_name, t_audio in trajectory_audios.items():
+                        safe_name = t_name.replace(".", "p")
+                        self._log_mlflow_artifact(
+                            pl_module,
+                            os.path.join(sample_dir, f"enhanced_{safe_name}.wav"),
+                            artifact_path=f"{tb_preffix}_{suffix}",
+                        )
+
         # --- Audio & Waveform Plots (Logger) ---
         enhanced_noisy = enhanced - static_data['noisy']
         enhanced_clean = enhanced - static_data['clean']
+
 
         if tb is not None:
             tb.add_audio(f"{tb_preffix}_{suffix}/audio_clean", static_data['clean'].flatten().unsqueeze(0), step, sample_rate=sr)
@@ -325,13 +476,59 @@ class LoggingCallback(pl.Callback):
                         step,
                         sample_rate=sr,
                     )
-            
+
             tb.add_image(f"{tb_preffix}_{suffix}/wave_clean", static_data['wave_clean'], step)
             tb.add_image(f"{tb_preffix}_{suffix}/wave_noisy", static_data['wave_noisy'], step)
             tb.add_image(f"{tb_preffix}_{suffix}/wave_enhanced", self._plot_waveform_to_tensor(enhanced, "Enhanced"), step)
             tb.add_image(f"{tb_preffix}_{suffix}/wave_enhanced_noisy", self._plot_waveform_to_tensor(enhanced_noisy, "Enhanced - Noisy"), step)
             tb.add_image(f"{tb_preffix}_{suffix}/wave_enhanced_clean", self._plot_waveform_to_tensor(enhanced_clean, "Enhanced - Clean"), step)
             tb.add_image(f"{tb_preffix}_{suffix}/wave_clean_noisy", static_data['wave_diff'], step)
+        elif mlflow_logger is not None:
+            for label, wav in {
+                "audio_clean": static_data['clean'],
+                "audio_noisy": static_data['noisy'],
+                "audio_enhanced": enhanced,
+                "audio_enhanced_noisy": enhanced_noisy,
+                "audio_enhanced_clean": enhanced_clean,
+                "audio_clean_noisy": static_data['clean_noisy'],
+            }.items():
+                tmp_path = os.path.join(local_path or "test_results", f"{tb_preffix}_{suffix}_{label}_step{step}.wav") if local_path else os.path.join("test_results", f"{tb_preffix}_{suffix}_{label}_step{step}.wav")
+                os.makedirs(os.path.dirname(tmp_path), exist_ok=True)
+                torchaudio.save(tmp_path, wav.flatten().unsqueeze(0).cpu(), sr)
+                try:
+                    self._log_mlflow_artifact(pl_module, tmp_path, artifact_path=f"{tb_preffix}_{suffix}_step{step}")
+                finally:
+                    if local_path is None:
+                        try:
+                            os.remove(tmp_path)
+                        except FileNotFoundError:
+                            pass
+
+            if trajectory_audios:
+                for t_name, t_audio in trajectory_audios.items():
+                    wav = t_audio.detach().cpu()
+                    if wav.ndim == 1:
+                        wav = wav.unsqueeze(0)
+                    safe_name = t_name.replace(".", "p")
+                    tmp_path = os.path.join(local_path or "test_results", f"{tb_preffix}_{suffix}_enhanced_{safe_name}_step{step}.wav") if local_path else os.path.join("test_results", f"{tb_preffix}_{suffix}_enhanced_{safe_name}_step{step}.wav")
+                    os.makedirs(os.path.dirname(tmp_path), exist_ok=True)
+                    torchaudio.save(tmp_path, wav, sr)
+                    try:
+                        self._log_mlflow_artifact(pl_module, tmp_path, artifact_path=f"{tb_preffix}_{suffix}_enhanced_{safe_name}_step{step}")
+                    finally:
+                        if local_path is None:
+                            try:
+                                os.remove(tmp_path)
+                            except FileNotFoundError:
+                                pass
+
+            self._log_mlflow_image(pl_module, static_data['wave_clean'], f"{tb_preffix}_{suffix}/wave_clean", step)
+            self._log_mlflow_image(pl_module, static_data['wave_noisy'], f"{tb_preffix}_{suffix}/wave_noisy", step)
+            self._log_mlflow_image(pl_module, self._plot_waveform_to_tensor(enhanced, "Enhanced"), f"{tb_preffix}_{suffix}/wave_enhanced", step)
+            self._log_mlflow_image(pl_module, self._plot_waveform_to_tensor(enhanced_noisy, "Enhanced - Noisy"), f"{tb_preffix}_{suffix}/wave_enhanced_noisy", step)
+            self._log_mlflow_image(pl_module, self._plot_waveform_to_tensor(enhanced_clean, "Enhanced - Clean"), f"{tb_preffix}_{suffix}/wave_enhanced_clean", step)
+            self._log_mlflow_image(pl_module, static_data['wave_diff'], f"{tb_preffix}_{suffix}/wave_clean_noisy", step)
+            
 
         mel_trans = self._get_mel_trans(cfg)
         spec_clean = self.to_absolute_db(static_data['clean'], mel_trans)
@@ -366,6 +563,8 @@ class LoggingCallback(pl.Callback):
             img = torch.clamp(img, 0, 1)
             if tb is not None:
                 tb.add_image(f"{tb_preffix}_{suffix}/spec_{tag}", img, step)
+            elif mlflow_logger is not None:
+                self._log_mlflow_image(pl_module, img, f"{tb_preffix}_{suffix}/spec_{tag}", step)
 
         for tag, image in [
             ("stft_mag_clean", stft_mag_clean),
@@ -377,6 +576,8 @@ class LoggingCallback(pl.Callback):
         ]:
             if tb is not None:
                 tb.add_image(f"{tb_preffix}_{suffix}/{tag}", image, step)
+            elif mlflow_logger is not None:
+                self._log_mlflow_image(pl_module, image, f"{tb_preffix}_{suffix}/{tag}", step)
 
         # MSE
         mse_rec = F.mse_loss(static_data['clean_noisy'], enhanced_noisy.flatten())
@@ -395,19 +596,22 @@ class LoggingCallback(pl.Callback):
         # SegSNR
         seg_snr = compute_seg_snr(static_data['clean'], enhanced)
 
+        metrics_to_log = {
+            "seg_snr": seg_snr,
+            "energy_ratio": energy_ratio,
+            "correlation": correlation,
+            "mse_reconstruction": mse_rec,
+            "mse_noise_extraction": mse_noise,
+        }
         if tb is not None:
-            metrics_to_log = {
-                "seg_snr": seg_snr,
-                "energy_ratio": energy_ratio,
-                "correlation": correlation,
-                "mse_reconstruction": mse_rec,
-                "mse_noise_extraction": mse_noise
-            }
             for m_name, m_val in metrics_to_log.items():
                 tb.add_scalar(f"{tb_preffix}_{suffix}/{m_name}", m_val, step)
+        elif mlflow_logger is not None:
+            for m_name, m_val in metrics_to_log.items():
+                mlflow_logger.log_metrics({f"{tb_preffix}_{suffix}/{m_name}": float(m_val)}, step=step)
 
     def save_test_metrics(self, pl_module: pl.LightningModule, local_path: str = None, trainer: pl.Trainer = None) -> None:
-        tb = pl_module.logger.experiment if pl_module.logger and hasattr(pl_module.logger, "experiment") else None
+        tb = self._tensorboard_backend(pl_module)
 
         # 1. Coleta métricas do pl_module.test_metrics_buffer
         metrics_list = getattr(pl_module, "test_metrics_buffer", [])
@@ -431,15 +635,18 @@ class LoggingCallback(pl.Callback):
 
         # 3. Salva o CSV como texto no TensorBoard
         csv_text = df.to_csv(index=False)
+        logger = getattr(trainer, "logger", None)
+        base_dir = local_path or getattr(logger, "log_dir", None) or "test_results"
+        os.makedirs(base_dir, exist_ok=True)
+
         if tb:
             tb.add_text("test/individual_metrics", f"```csv\n{csv_text}\n```", global_step=pl_module.global_step)
-        
-        try:
-            log_dir = trainer.logger.log_dir  # dir do run atual
-        except AttributeError:
-            log_dir = 'test_results'
+        elif self._mlflow_logger(pl_module) is not None:
+            csv_path = os.path.join(base_dir, "test_metrics.csv")
+            df.to_csv(csv_path, index=False)
+            self._log_mlflow_artifact(pl_module, csv_path, artifact_path="test")
 
-        save_path = os.path.join(local_path, "test_metrics.csv") if local_path else os.path.join(log_dir, "test_results.csv")
+        save_path = os.path.join(base_dir, "test_metrics.csv")
         df.to_csv(save_path, index=False)
         # 4. Limpa buffer para liberar memória
         pl_module.test_metrics_buffer.clear()
